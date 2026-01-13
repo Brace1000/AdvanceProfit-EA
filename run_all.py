@@ -19,7 +19,7 @@ print("=" * 60)
 # STEP 1: Load and Clean Data
 # ============================================================================
 print("\n[1/3] Loading and cleaning data...")
-
+ort xgboost as xgb
 df = pd.read_csv("EURUSD_D1_raw.csv", on_bad_lines='skip')
 df.columns = df.columns.str.strip().str.lower()
 
