@@ -3,7 +3,7 @@
 //|                   Advanced Trading System with ML Integration     |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
-#property version   "2.10"
+#property version   "2.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -37,7 +37,7 @@ input double ATR_Multiplier = 2.0;           // ATR multiplier for SL/TP
 
 input group "=== Trade Filters ==="
 input bool   UseTrendFilter = true;          // Only trade with trend
-input int    TrendMA_Period = 50;           // Trend MA Period
+input int    TrendMA_Period = 50;            // Trend MA Period
 input bool   UseTimeFilter = true;           // Enable time filter
 input int    StartHour = 8;                  // Trading start hour
 input int    EndHour = 20;                   // Trading end hour
@@ -57,7 +57,11 @@ CPositionInfo posInfo;
 CAccountInfo accInfo;
 
 int handleMA_Fast, handleMA_Slow, handleRSI, handleATR, handleTrendMA;
-int handleEMA50, handleEMA200, handleADX, handleRSI_D1;
+
+// ML indicator handles (H1 + H4)
+int handleEMA50_H1, handleEMA200_H1, handleADX_H1, handleRSI_H1, handleATR_H1;
+int handleEMA50_H4, handleEMA200_H4, handleADX_H4, handleRSI_H4, handleATR_H4;
+
 double dailyStartBalance;
 datetime lastBarTime;
 int totalTradesToday = 0;
@@ -73,27 +77,36 @@ double StringToDoubleCustom(const string value);
 int OnInit()
 {
    Print("========================================");
-   Print("Advanced Profit EA v2.10 with ML");
+   Print("Advanced Profit EA v2.20 with ML (H1 + H4 features)");
    Print("========================================");
    
-   // Initialize indicators
+   // Initialize indicators (for technical strategy on current chart timeframe)
    handleMA_Fast = iMA(_Symbol, _Period, MA_Fast, 0, MODE_SMA, PRICE_CLOSE);
    handleMA_Slow = iMA(_Symbol, _Period, MA_Slow, 0, MODE_SMA, PRICE_CLOSE);
    handleRSI = iRSI(_Symbol, _Period, RSI_Period, PRICE_CLOSE);
    handleATR = iATR(_Symbol, _Period, ATR_Period);
    handleTrendMA = iMA(_Symbol, _Period, TrendMA_Period, 0, MODE_SMA, PRICE_CLOSE);
    
-   // ML-specific indicators (daily timeframe)
-   handleEMA50 = iMA(_Symbol, PERIOD_D1, 50, 0, MODE_EMA, PRICE_CLOSE);
-   handleEMA200 = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
-   handleADX = iADX(_Symbol, PERIOD_D1, 14);
-   handleRSI_D1 = iRSI(_Symbol, PERIOD_D1, RSI_Period, PRICE_CLOSE);
+   // ML-specific indicators (H1 and H4 timeframes)
+   handleEMA50_H1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA200_H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   handleADX_H1 = iADX(_Symbol, PERIOD_H1, 14);
+   handleRSI_H1 = iRSI(_Symbol, PERIOD_H1, RSI_Period, PRICE_CLOSE);
+   handleATR_H1 = iATR(_Symbol, PERIOD_H1, ATR_Period);
+
+   handleEMA50_H4 = iMA(_Symbol, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA200_H4 = iMA(_Symbol, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE);
+   handleADX_H4 = iADX(_Symbol, PERIOD_H4, 14);
+   handleRSI_H4 = iRSI(_Symbol, PERIOD_H4, RSI_Period, PRICE_CLOSE);
+   handleATR_H4 = iATR(_Symbol, PERIOD_H4, ATR_Period);
    
    if(handleMA_Fast == INVALID_HANDLE || handleMA_Slow == INVALID_HANDLE ||
       handleRSI == INVALID_HANDLE || handleATR == INVALID_HANDLE || 
-      handleTrendMA == INVALID_HANDLE || handleEMA50 == INVALID_HANDLE ||
-      handleEMA200 == INVALID_HANDLE || handleADX == INVALID_HANDLE ||
-      handleRSI_D1 == INVALID_HANDLE)
+      handleTrendMA == INVALID_HANDLE ||
+      handleEMA50_H1 == INVALID_HANDLE || handleEMA200_H1 == INVALID_HANDLE ||
+      handleADX_H1 == INVALID_HANDLE || handleRSI_H1 == INVALID_HANDLE || handleATR_H1 == INVALID_HANDLE ||
+      handleEMA50_H4 == INVALID_HANDLE || handleEMA200_H4 == INVALID_HANDLE ||
+      handleADX_H4 == INVALID_HANDLE || handleRSI_H4 == INVALID_HANDLE || handleATR_H4 == INVALID_HANDLE)
    {
       Print("Error initializing indicators!");
       return(INIT_FAILED);
@@ -125,10 +138,18 @@ void OnDeinit(const int reason)
    IndicatorRelease(handleRSI);
    IndicatorRelease(handleATR);
    IndicatorRelease(handleTrendMA);
-   IndicatorRelease(handleEMA50);
-   IndicatorRelease(handleEMA200);
-   IndicatorRelease(handleADX);
-   IndicatorRelease(handleRSI_D1);
+
+   IndicatorRelease(handleEMA50_H1);
+   IndicatorRelease(handleEMA200_H1);
+   IndicatorRelease(handleADX_H1);
+   IndicatorRelease(handleRSI_H1);
+   IndicatorRelease(handleATR_H1);
+
+   IndicatorRelease(handleEMA50_H4);
+   IndicatorRelease(handleEMA200_H4);
+   IndicatorRelease(handleADX_H4);
+   IndicatorRelease(handleRSI_H4);
+   IndicatorRelease(handleATR_H4);
    
    Print("EA Stopped. Total trades today: ", totalTradesToday);
    Print("Daily P&L: $", dailyProfitLoss);
@@ -172,75 +193,125 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Get ML prediction from Python API                                |
+//| Get ML prediction from Python API (H1 + H4 features)             |
 //+------------------------------------------------------------------+
 int GetMLPrediction(double &confidence)
 {
    if(!UseMLPredictions)
       return 0;
    
-   // Calculate features for ML model (daily timeframe)
-   double ema50[2], ema200[2], rsi_daily[2], atr[2], adx_main[2];
-   double close_d1[3], open_d1[2], high_d1[2], low_d1[2];
+   // H1 indicator buffers
+   double ema50_h1[2], ema200_h1[2], rsi_h1[2], atr_h1[2], adx_h1[2];
+   double close_h1[3], open_h1[2], high_h1[2], low_h1[2];
+
+   // H4 indicator buffers
+   double ema50_h4[2], ema200_h4[2], rsi_h4[2], atr_h4[2], adx_h4[2];
+   double close_h4[3], open_h4[2], high_h4[2], low_h4[2];
    
-   ArraySetAsSeries(ema50, true);
-   ArraySetAsSeries(ema200, true);
-   ArraySetAsSeries(rsi_daily, true);
-   ArraySetAsSeries(atr, true);
-   ArraySetAsSeries(adx_main, true);
-   ArraySetAsSeries(close_d1, true);
-   ArraySetAsSeries(open_d1, true);
-   ArraySetAsSeries(high_d1, true);
-   ArraySetAsSeries(low_d1, true);
+   ArraySetAsSeries(ema50_h1, true); ArraySetAsSeries(ema200_h1, true);
+   ArraySetAsSeries(rsi_h1, true);   ArraySetAsSeries(atr_h1, true);
+   ArraySetAsSeries(adx_h1, true);
+   ArraySetAsSeries(close_h1, true); ArraySetAsSeries(open_h1, true);
+   ArraySetAsSeries(high_h1, true);  ArraySetAsSeries(low_h1, true);
+
+   ArraySetAsSeries(ema50_h4, true); ArraySetAsSeries(ema200_h4, true);
+   ArraySetAsSeries(rsi_h4, true);   ArraySetAsSeries(atr_h4, true);
+   ArraySetAsSeries(adx_h4, true);
+   ArraySetAsSeries(close_h4, true); ArraySetAsSeries(open_h4, true);
+   ArraySetAsSeries(high_h4, true);  ArraySetAsSeries(low_h4, true);
    
-   // Copy indicator data
-   if(CopyBuffer(handleEMA50, 0, 0, 2, ema50) < 2 ||
-      CopyBuffer(handleEMA200, 0, 0, 2, ema200) < 2 ||
-      CopyBuffer(handleRSI_D1, 0, 0, 2, rsi_daily) < 2 ||
-      CopyBuffer(handleATR, 0, 0, 2, atr) < 2 ||
-      CopyBuffer(handleADX, 0, 0, 2, adx_main) < 2)
+   // Copy H1 indicators
+   if(CopyBuffer(handleEMA50_H1, 0, 0, 2, ema50_h1) < 2 ||
+      CopyBuffer(handleEMA200_H1, 0, 0, 2, ema200_h1) < 2 ||
+      CopyBuffer(handleRSI_H1, 0, 0, 2, rsi_h1) < 2 ||
+      CopyBuffer(handleATR_H1, 0, 0, 2, atr_h1) < 2 ||
+      CopyBuffer(handleADX_H1, 0, 0, 2, adx_h1) < 2)
    {
-      Print("Failed to copy indicator data for ML");
+      Print("Failed to copy H1 indicator data for ML");
       return 0;
    }
-   
-   // Copy price data for daily
-   if(CopyClose(_Symbol, PERIOD_D1, 0, 3, close_d1) < 3 ||
-      CopyOpen(_Symbol, PERIOD_D1, 0, 2, open_d1) < 2 ||
-      CopyHigh(_Symbol, PERIOD_D1, 0, 2, high_d1) < 2 ||
-      CopyLow(_Symbol, PERIOD_D1, 0, 2, low_d1) < 2)
+   // Copy H1 prices
+   if(CopyClose(_Symbol, PERIOD_H1, 0, 3, close_h1) < 3 ||
+      CopyOpen(_Symbol, PERIOD_H1, 0, 2, open_h1) < 2 ||
+      CopyHigh(_Symbol, PERIOD_H1, 0, 2, high_h1) < 2 ||
+      CopyLow(_Symbol, PERIOD_H1, 0, 2, low_h1) < 2)
    {
-      Print("Failed to copy price data for ML");
+      Print("Failed to copy H1 price data for ML");
       return 0;
    }
+
+   // Copy H4 indicators
+   if(CopyBuffer(handleEMA50_H4, 0, 0, 2, ema50_h4) < 2 ||
+      CopyBuffer(handleEMA200_H4, 0, 0, 2, ema200_h4) < 2 ||
+      CopyBuffer(handleRSI_H4, 0, 0, 2, rsi_h4) < 2 ||
+      CopyBuffer(handleATR_H4, 0, 0, 2, atr_h4) < 2 ||
+      CopyBuffer(handleADX_H4, 0, 0, 2, adx_h4) < 2)
+   {
+      Print("Failed to copy H4 indicator data for ML");
+      return 0;
+   }
+   // Copy H4 prices
+   if(CopyClose(_Symbol, PERIOD_H4, 0, 3, close_h4) < 3 ||
+      CopyOpen(_Symbol, PERIOD_H4, 0, 2, open_h4) < 2 ||
+      CopyHigh(_Symbol, PERIOD_H4, 0, 2, high_h4) < 2 ||
+      CopyLow(_Symbol, PERIOD_H4, 0, 2, low_h4) < 2)
+   {
+      Print("Failed to copy H4 price data for ML");
+      return 0;
+   }
+
+   // Compute H1 features
+   double close_ema50_h1 = ema50_h1[0];
+   double ema50_ema200_h1 = ema50_h1[0] - ema200_h1[0];
+   double rsi_val_h1 = rsi_h1[0];
+   double rsi_slope_h1 = rsi_h1[0] - rsi_h1[1];
+   double atr_ratio_h1 = atr_h1[0] / close_h1[0];
+   double adx_val_h1 = adx_h1[0];
+   double body_h1 = close_h1[0] - open_h1[0];
+   double range_h1 = high_h1[0] - low_h1[0];
    
-   // Calculate features matching Python model
-   double close_ema50_val = ema50[0];
-   double ema50_ema200_val = ema50[0] - ema200[0];
-   double rsi_val = rsi_daily[0];
-   double rsi_slope = rsi_daily[0] - rsi_daily[1];
-   double atr_ratio = atr[0] / close_d1[0];
-   double adx_val = adx_main[0];
-   double body = close_d1[0] - open_d1[0];
-   double range = high_d1[0] - low_d1[0];
-   double hour = 0; // Daily data
-   double session = 0; // Daily data
-   double prev_return = (close_d1[0] - close_d1[1]) / close_d1[1];
-   
-   // Build JSON request PROPERLY
+   // Hour and session from server time
+   MqlDateTime now;
+   TimeToStruct(TimeCurrent(), now);
+   double hour = now.hour;
+   double session = 0;
+   if(now.hour >= 13 && now.hour <= 21)
+      session = 2; // US
+   else if(now.hour >= 7 && now.hour <= 15)
+      session = 1; // Europe
+   else
+      session = 0; // Asia/other
+
+   double prev_return_h1 = 0.0;
+   if(close_h1[1] != 0.0)
+      prev_return_h1 = (close_h1[0] - close_h1[1]) / close_h1[1];
+
+   // Compute H4 features
+   double close_ema50_h4 = ema50_h4[0];
+   double ema50_ema200_h4 = ema50_h4[0] - ema200_h4[0];
+   double rsi_val_h4 = rsi_h4[0];
+   double rsi_slope_h4 = rsi_h4[0] - rsi_h4[1];
+   double atr_ratio_h4 = atr_h4[0] / close_h4[0];
+   double adx_val_h4 = adx_h4[0];
+   double body_h4 = close_h4[0] - open_h4[0];
+   double range_h4 = high_h4[0] - low_h4[0];
+
+   double prev_return_h4 = 0.0;
+   if(close_h4[1] != 0.0)
+      prev_return_h4 = (close_h4[0] - close_h4[1]) / close_h4[1];
+
+   // Build JSON request with 20 features in the exact order expected by Python
    string features = StringFormat(
-      "[%.5f,%.6f,%.2f,%.3f,%.6f,%.2f,%.6f,%.6f,%.0f,%.0f,%.6f]",
-      close_ema50_val, ema50_ema200_val, rsi_val, rsi_slope,
-      atr_ratio, adx_val, body, range, hour, session, prev_return
+      "[%.6f,%.6f,%.4f,%.6f,%.8f,%.4f,%.8f,%.8f,%.0f,%.0f,%.8f,%.6f,%.6f,%.4f,%.6f,%.8f,%.4f,%.8f,%.8f,%.8f]",
+      // H1 features
+      close_ema50_h1, ema50_ema200_h1, rsi_val_h1, rsi_slope_h1,
+      atr_ratio_h1, adx_val_h1, body_h1, range_h1, hour, session, prev_return_h1,
+      // H4 features
+      close_ema50_h4, ema50_ema200_h4, rsi_val_h4, rsi_slope_h4,
+      atr_ratio_h4, adx_val_h4, body_h4, range_h4, prev_return_h4
    );
    
    string json_request = "{\"features\":" + features + "}";
-   
-   Print("Sending ML request: ", json_request);
-   
-   // IMPORTANT: WebRequest requires DLL imports to be allowed
-   // Go to Tools -> Options -> Expert Advisors -> Allow WebRequest for listed URLs
-   // Add: http://127.0.0.1,http://localhost
    
    // Make HTTP request
    uchar post_data[];
@@ -250,11 +321,8 @@ int GetMLPrediction(double &confidence)
    StringToCharArray(json_request, post_data, 0, StringLen(json_request));
    
    int timeout = 5000; // 5 seconds
-   
-   // Reset last error
    ResetLastError();
    
-   // Make WebRequest with proper headers
    string headers = "Content-Type: application/json\r\n";
    int res = WebRequest(
       "POST",
@@ -290,7 +358,6 @@ int GetMLPrediction(double &confidence)
       return 0;
    }
    
-   // Parse response
    string response = CharArrayToString(result_data);
    Print("API Response: ", response);
    
@@ -306,14 +373,12 @@ int GetMLPrediction(double &confidence)
    Print("  Sell: ", DoubleToString(sell_prob*100, 1), "% | Range: ", 
          DoubleToString(range_prob*100, 1), "% | Buy: ", DoubleToString(buy_prob*100, 1), "%");
    
-   // Check confidence threshold
    if(confidence < ML_Confidence_Threshold)
    {
       Print("ML confidence too low, skipping trade");
       return 0;
    }
    
-   // Return signal
    if(prediction == "buy")
       return 1;
    else if(prediction == "sell")
@@ -322,8 +387,6 @@ int GetMLPrediction(double &confidence)
       return 0;
 }
 
-//+------------------------------------------------------------------+
-//| Get combined trade signal (ML + Technical)                       |
 //+------------------------------------------------------------------+
 //| Get combined trade signal (ML + Technical)                       |
 //+------------------------------------------------------------------+
