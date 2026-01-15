@@ -1,0 +1,189 @@
+# AdvanceProfit-EA Configuration File
+# Copy this to config.local.yaml and customize for your environment
+# config.local.yaml is gitignored and won't be committed
+
+# API Keys for Data Sources
+data_sources:
+  alpha_vantage:
+    api_key: "your_key_here"
+    enabled: false
+
+  binance:
+    api_key: "your_key_here"
+    api_secret: "your_secret_here"
+    enabled: false
+
+  coinbase:
+    api_key: "your_key_here"
+    api_secret: "your_secret_here"
+    enabled: false
+
+  mt5:
+    enabled: true
+    login: null
+    password: null
+    server: null
+
+# Model Configuration
+model:
+  path: "xgb_eurusd_h1.pkl"
+  feature_count: 20  # H1 + H4 features
+  features:
+    - close_ema50_h1
+    - ema50_ema200_h1
+    - rsi_h1
+    - rsi_slope_h1
+    - atr_ratio_h1
+    - adx_h1
+    - body_h1
+    - range_h1
+    - hour
+    - session
+    - prev_return_h1
+    - close_ema50_h4
+    - ema50_ema200_h4
+    - rsi_h4
+    - rsi_slope_h4
+    - atr_ratio_h4
+    - adx_h4
+    - body_h4
+    - range_h4
+    - prev_return_h4
+
+# XGBoost Training Parameters
+training:
+  n_estimators: 100
+  max_depth: 3
+  learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 1.0
+  reg_lambda: 1.0
+  min_child_weight: 3
+  gamma: 0.1
+  objective: "multi:softprob"
+  num_class: 3
+  random_state: 42
+  early_stopping_rounds: 20
+  test_size: 0.3
+
+# Hyperparameter Optimization (Optuna)
+hpo:
+  enabled: false
+  n_trials: 100
+  study_name: "xgboost_optimization"
+  database: "sqlite:///optuna_study.db"
+  direction: "maximize"  # maximize validation accuracy
+  parameters:
+    n_estimators: [50, 100, 200, 400]
+    max_depth: [2, 3, 4, 5, 6]
+    learning_rate: [0.01, 0.05, 0.1, 0.2]
+    subsample: [0.6, 0.7, 0.8, 0.9, 1.0]
+    colsample_bytree: [0.6, 0.7, 0.8, 0.9, 1.0]
+    reg_alpha: [0, 0.1, 0.5, 1.0, 2.0]
+    reg_lambda: [0, 0.1, 0.5, 1.0, 2.0]
+    min_child_weight: [1, 2, 3, 5, 7]
+    gamma: [0, 0.1, 0.5, 1.0]
+
+# FastAPI Server Configuration
+api:
+  host: "127.0.0.1"
+  port: 8000
+  reload: true
+  workers: 1
+  log_level: "info"
+
+# Trading Configuration
+trading:
+  mode: "paper"  # paper or live
+  symbol: "EURUSD"
+
+  # Risk Management
+  risk:
+    risk_percent: 1.0
+    max_daily_loss: 3.0
+    max_daily_profit: 5.0
+    max_simultaneous_trades: 3
+
+  # ML Settings
+  ml:
+    use_predictions: true
+    confidence_threshold: 0.40
+    combine_with_technical: false  # true = ML + Technical, false = ML only
+
+  # Position Management
+  position:
+    use_trailing_stop: true
+    trailing_stop_pips: 30
+    trailing_step_pips: 10
+    use_breakeven: true
+    breakeven_trigger_pips: 20
+    breakeven_offset_pips: 5
+    use_partial_close: true
+    partial_close_percent: 50.0
+
+  # Filters
+  filters:
+    use_time_filter: true
+    start_hour: 8
+    end_hour: 20
+    use_volatility_filter: true
+    min_atr: 0.0001
+    use_trend_filter: true
+
+# Data Collection
+data_collection:
+  symbol: "EURUSD"
+  timeframe: "D1"  # D1, H4, H1, M15, etc.
+  start_date: "2018-01-01"
+  end_date: "2024-12-31"
+  update_interval: "daily"  # daily, hourly, etc.
+
+# Backtesting
+backtesting:
+  initial_cash: 10000.0
+  commission: 0.0001  # 0.01%
+  slippage: 0.00005
+  start_date: "2023-01-01"
+  end_date: "2024-12-31"
+  timeframe: "H1"
+
+# Experiment Tracking (MLflow)
+mlflow:
+  enabled: true
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "trading_bot_experiments"
+  artifact_location: "./experiments"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/trading_bot.log"
+  console: true
+
+# Notifications (optional)
+notifications:
+  telegram:
+    enabled: false
+    bot_token: "your_token_here"
+    chat_id: "your_chat_id"
+    send_trade_notifications: false
+    send_error_notifications: true
+
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    from_email: "your_email@gmail.com"
+    password: "your_password"
+    to_email: "your_email@gmail.com"
+
+# Paths
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  models: "models"
+  logs: "logs"
+  experiments: "experiments"
+  notebooks: "notebooks"
