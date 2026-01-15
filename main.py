@@ -1,56 +1,59 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pathlib import Path
+from typing import Optional
+
 import joblib
 import numpy as np
-from pathlib import Path
-import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from src.config import get_config
+from src.logger import get_logger
 
 app = FastAPI(title="EUR/USD Trading Model API")
+logger = get_logger("trading_bot.api")
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "xgb_eurusd_h1.pkl"
-
-# Load model on startup
 model = None
-expected_n_features = None
-feature_names = None
+expected_n_features: Optional[int] = None
+feature_names: Optional[list[str]] = None
+
 
 @app.on_event("startup")
 async def load_model():
     global model, expected_n_features, feature_names
-    if not MODEL_PATH.exists():
-        print(f"⚠️  Warning: Model file not found at {MODEL_PATH}")
-        print("Please run run_all.py first to create the model.")
-    else:
-        model = joblib.load(MODEL_PATH)
-        print(f"✅ Model loaded successfully from {MODEL_PATH}")
-        # Infer expected feature length
-        if hasattr(model, "n_features_in_"):
-            expected_n_features = int(model.n_features_in_)
-            print(f"Expected number of features: {expected_n_features}")
-        # Try to load feature_names_ from a companion file written by the trainer in the future
-        names_path = BASE_DIR / "feature_names.json"
-        if names_path.exists():
-            try:
-                import json
-                feature_names = json.loads(names_path.read_text())
-            except Exception:
-                feature_names = None
 
-# Define request model for better validation
+    cfg = get_config()
+    model_path = Path(cfg.get("model.path", "xgb_eurusd_h1.pkl"))
+
+    if not model_path.exists():
+        logger.warning(f"Model file not found at {model_path}. Run run_all.py to train and save the model.")
+        return
+
+    model = joblib.load(model_path)
+    logger.info(f"Model loaded from {model_path}")
+
+    if hasattr(model, "n_features_in_"):
+        expected_n_features = int(model.n_features_in_)
+        logger.info(f"Expected number of features: {expected_n_features}")
+
+    names_path = Path("feature_names.json")
+    if names_path.exists():
+        try:
+            import json
+            feature_names = json.loads(names_path.read_text())
+        except Exception:
+            feature_names = None
+
+
 class PredictionRequest(BaseModel):
     features: list[float]
-    
+
     class Config:
         json_schema_extra = {
             "example": {
-                "features": [
-                    # Example for 20-feature H1+H4 model (order printed by run_all.py)
-                    1.080123, 0.001234, 52.3, 0.2401, 0.00012345, 18.2, 0.00010, 0.00030, 14, 1, 0.00020,
-                    1.079876, 0.001100, 48.7, -0.2102, 0.00015000, 16.5, 0.00008, 0.00025, 0.00010
-                ]
+                "features": [0.0] * 11
             }
         }
+
 
 @app.get("/")
 def root():
@@ -59,52 +62,51 @@ def root():
         "model_loaded": model is not None,
         "expected_n_features": expected_n_features,
         "feature_names": feature_names,
-        "endpoints": {
-            "/predict": "POST - Make predictions",
-            "/health": "GET - Check API health"
-        }
+        "endpoints": {"/predict": "POST", "/health": "GET"},
     }
+
 
 @app.get("/health")
 def health():
+    cfg = get_config()
+    model_path = cfg.get("model.path", "xgb_eurusd_h1.pkl")
     return {
         "status": "healthy" if model is not None else "model_not_loaded",
-        "model_path": str(MODEL_PATH),
-        "model_exists": MODEL_PATH.exists(),
+        "model_path": model_path,
+        "model_exists": Path(model_path).exists(),
         "expected_n_features": expected_n_features,
     }
+
 
 @app.post("/predict")
 def predict(request: PredictionRequest):
     if model is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Model not loaded. Please train the model first by running run_all.py"
-        )
-    
-    features = request.features
+        raise HTTPException(status_code=503, detail="Model not loaded. Train model via run_all.py")
 
-    # Validate feature length dynamically against the model
+    features = request.features
     if expected_n_features is not None and len(features) != expected_n_features:
         raise HTTPException(
             status_code=400,
             detail=f"Expected {expected_n_features} features, got {len(features)}."
-                    + (f" Names: {feature_names}" if feature_names else "")
+                   + (f" Names: {feature_names}" if feature_names else ""),
         )
-    
+
     try:
-        X = np.array(features).reshape(1, -1)
+        X = np.array(features, dtype=float).reshape(1, -1)
         probs = model.predict_proba(X)[0]
         return {
             "sell": float(probs[0]),
             "range": float(probs[1]),
             "buy": float(probs[2]),
             "prediction": ["sell", "range", "buy"][int(np.argmax(probs))],
-            "confidence": float(np.max(probs))
+            "confidence": float(np.max(probs)),
         }
     except Exception as e:
+        logger.exception("Prediction error")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    cfg = get_config()
+    uvicorn.run(app, host=cfg.get("api.host", "0.0.0.0"), port=int(cfg.get("api.port", 8000)))
