@@ -149,10 +149,10 @@ trading:
 # Data Collection
 data_collection:
   symbol: "EURUSD"
-  timeframe: "D1"  # D1, H4, H1, M15, etc.
+  timeframe: "H1"  # D1, H4, H1, M15, etc.
   start_date: "2018-01-01"
   end_date: "2024-12-31"
-  update_interval: "daily"  # daily, hourly, etc.
+  update_interval: "hourly"  # daily, hourly, etc.
 
 # Backtesting
 backtesting:
@@ -195,10 +195,13 @@ notifications:
     to_email: "your_email@gmail.com"
 
 # Paths
-paths:
+paths:these directories: ['/home/bobaigwa/Desktop/AdvanceProfit-EA']
+INFO:     Uvicorn running on http://
   data_raw: "data/raw"
   data_processed: "data/processed"
   models: "models"
   logs: "logs"
   experiments: "experiments"
   notebooks: "notebooks"
+  data_raw_file: "EURUSD_H1_raw.csv"
+  data_processed_file: "EURUSD_H1_clean.csv"
