@@ -65,6 +65,16 @@ class TrainingPipeline:
         df["label"] = labels
         return df
 
+    def _get_class_distribution(self, y: np.ndarray) -> Dict[str, float]:
+        """Calculate class distribution percentages."""
+        total = len(y)
+        if total == 0:
+            return {"sell": 0.0, "range": 0.0, "buy": 0.0}
+        sell_pct = float(np.sum(y == 0) / total)
+        range_pct = float(np.sum(y == 1) / total)
+        buy_pct = float(np.sum(y == 2) / total)
+        return {"sell": sell_pct, "range": range_pct, "buy": buy_pct}
+
     def _three_way_split(
         self, X: np.ndarray, y: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -186,6 +196,13 @@ class TrainingPipeline:
         X = df[feature_cols].values
         y = pd.Series(df["label"]).map({-1: 0, 0: 1, 1: 2}).values
 
+        # Log class distribution
+        class_dist = self._get_class_distribution(y)
+        logger.info(
+            f"Class distribution: Sell={class_dist['sell']:.1%}, "
+            f"Range={class_dist['range']:.1%}, Buy={class_dist['buy']:.1%}"
+        )
+
         # 3-way split
         X_train, X_val, X_holdout, y_train, y_val, y_holdout = self._three_way_split(X, y)
 
@@ -234,4 +251,5 @@ class TrainingPipeline:
             "sharpe": sharpe,
             "win_rate": win_rate,
             "max_drawdown": max_dd,
+            "class_distribution": class_dist,
         }
