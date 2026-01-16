@@ -27,17 +27,33 @@ data_sources:
 # Model Configuration
 model:
   path: "xgb_eurusd_h1.pkl"
-  feature_count: 9  # Updated: removed placeholder features
+  feature_count: 20  # H1 + H4 multi-timeframe features
   features:
-    - close_ema50
-    - ema50_ema200
-    - rsi
-    - rsi_slope
-    - atr_ratio
-    - adx
-    - body
-    - range
-    - prev_return
+    # H1 features
+    - close_ema50_h1
+    - ema50_ema200_h1
+    - rsi_h1
+    - rsi_slope_h1
+    - atr_ratio_h1
+    - adx_h1
+    - body_h1
+    - range_h1
+    # Time features
+    - hour
+    - session
+    # H1 return
+    - prev_return_h1
+    # H4 features
+    - close_ema50_h4
+    - ema50_ema200_h4
+    - rsi_h4
+    - rsi_slope_h4
+    - atr_ratio_h4
+    - adx_h4
+    - body_h4
+    - range_h4
+    # H4 return
+    - prev_return_h4
   params:
     # Default params - will be overridden by HPO
     max_depth: 3

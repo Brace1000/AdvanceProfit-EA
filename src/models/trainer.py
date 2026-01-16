@@ -14,6 +14,18 @@ from src.logger import get_logger
 logger = get_logger("trading_bot.model")
 
 
+def _get_nested(config: Dict[str, Any], key_path: str, default: Any = None) -> Any:
+    """Get nested config value using dot notation."""
+    keys = key_path.split('.')
+    value = config
+    for key in keys:
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        else:
+            return default
+    return value
+
+
 @dataclass
 class TrainResult:
     """Result of model training."""
@@ -34,6 +46,10 @@ class ModelTrainer:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+
+    def _get(self, key_path: str, default: Any = None) -> Any:
+        """Get config value using dot notation."""
+        return _get_nested(self.config, key_path, default)
 
     def train(
         self,
@@ -64,7 +80,9 @@ class ModelTrainer:
             "random_state": 42,
             "n_jobs": -1,
         }
-        params.update(self.config.get("model.params", {}))
+        model_params = self._get("model.params", {})
+        if model_params:
+            params.update(model_params)
 
         # Compute class-balanced sample weights
         sample_weight = self._compute_sample_weights(y_train)
@@ -78,7 +96,7 @@ class ModelTrainer:
 
         if X_val is not None and y_val is not None:
             # Training with early stopping on validation set
-            early_stopping_rounds = int(self.config.get("training.early_stopping_rounds", 20))
+            early_stopping_rounds = int(self._get("training.early_stopping_rounds", 20))
             logger.info(f"Using early stopping with {len(X_val)} validation samples")
 
             model.fit(
@@ -120,7 +138,7 @@ class ModelTrainer:
             )
 
         # Save model
-        model_path = self.config.get("model.path", "xgb_eurusd_h1.pkl")
+        model_path = self._get("model.path", "xgb_eurusd_h1.pkl")
         joblib.dump(model, model_path)
         logger.info(f"Model saved to {model_path}")
 

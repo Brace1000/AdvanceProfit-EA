@@ -43,16 +43,21 @@ class TrainingPipeline:
     """
 
     def __init__(self, config: Dict[str, Any] | None = None):
-        self.config = config or get_config()._config
+        self._config_obj = get_config()
+        self.config = config or self._config_obj._config
         self.loader = DataLoader(self.config)
         self.validator = DataValidator(self.config)
         self.fe = FeatureEngineer(self.config)
         self.trainer = ModelTrainer(self.config)
 
+    def _get(self, key_path: str, default: Any = None) -> Any:
+        """Get config value using dot notation."""
+        return self._config_obj.get(key_path, default)
+
     def _label(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create trading labels based on forward returns."""
-        buy_th = float(self.config.get("training.buy_threshold", 0.002))
-        sell_th = float(self.config.get("training.sell_threshold", -0.002))
+        buy_th = float(self._get("training.buy_threshold", 0.002))
+        sell_th = float(self._get("training.sell_threshold", -0.002))
         ahead_return = df["close"].shift(-1) / df["close"] - 1
         labels = np.zeros(len(df), dtype=int)
         labels[ahead_return > buy_th] = 1
@@ -69,8 +74,8 @@ class TrainingPipeline:
         Returns:
             X_train, X_val, X_holdout, y_train, y_val, y_holdout
         """
-        train_ratio = float(self.config.get("training.train_ratio", 0.6))
-        val_ratio = float(self.config.get("training.val_ratio", 0.2))
+        train_ratio = float(self._get("training.train_ratio", 0.6))
+        val_ratio = float(self._get("training.val_ratio", 0.2))
 
         n = len(X)
         train_end = int(n * train_ratio)
@@ -115,7 +120,7 @@ class TrainingPipeline:
         df = df.copy()
         df["position"] = pd.Series(preds).map({0: -1, 1: 0, 2: 1}).values
         df["next_ret"] = df["close"].pct_change(-1) * -1
-        trading_cost = float(self.config.get("backtesting.commission", 0.0001))
+        trading_cost = float(self._get("backtesting.commission", 0.0001))
 
         df = df.iloc[:-1].copy()
         if len(df) == 0:
@@ -156,8 +161,8 @@ class TrainingPipeline:
         5. Train final model on train+validation with early stopping
         6. Evaluate on holdout set (never seen before)
         """
-        raw_path = self.config.get("paths.data_raw_file", "EURUSD_D1_raw.csv")
-        processed_path = self.config.get("paths.data_processed_file", "EURUSD_D1_clean.csv")
+        raw_path = self._get("paths.data_raw_file", "EURUSD_H1_raw.csv")
+        processed_path = self._get("paths.data_processed_file", "EURUSD_H1_clean.csv")
 
         # Load and validate
         logger.info("Loading data...")
@@ -185,7 +190,7 @@ class TrainingPipeline:
         X_train, X_val, X_holdout, y_train, y_val, y_holdout = self._three_way_split(X, y)
 
         # HPO on train set, validated on validation set
-        if bool(self.config.get("hpo.enabled", True)):
+        if bool(self._get("hpo.enabled", True)):
             logger.info("Running hyperparameter optimization...")
             best_params, best_val = hpo_optimize(X_train, y_train, X_val, y_val, self.config)
             self.config.setdefault("model", {}).setdefault("params", {}).update(best_params)
@@ -208,8 +213,8 @@ class TrainingPipeline:
         logger.info(f"Holdout accuracy: {holdout_accuracy:.2%}")
 
         # Calculate split indices for backtest
-        train_ratio = float(self.config.get("training.train_ratio", 0.6))
-        val_ratio = float(self.config.get("training.val_ratio", 0.2))
+        train_ratio = float(self._get("training.train_ratio", 0.6))
+        val_ratio = float(self._get("training.val_ratio", 0.2))
         n = len(df)
         val_end = int(n * (train_ratio + val_ratio))
 

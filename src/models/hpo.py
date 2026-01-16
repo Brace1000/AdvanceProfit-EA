@@ -18,6 +18,18 @@ logger = get_logger("trading_bot.hpo")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
+def _get_nested(config: Dict[str, Any], key_path: str, default: Any = None) -> Any:
+    """Get nested config value using dot notation."""
+    keys = key_path.split('.')
+    value = config
+    for key in keys:
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        else:
+            return default
+    return value
+
+
 def suggest_params(trial: optuna.trial.Trial) -> Dict[str, Any]:
     """
     Suggest hyperparameters for XGBoost.
@@ -90,10 +102,10 @@ def optimize(
         best_params: Best hyperparameters found
         best_value: Best validation F1 score
     """
-    n_trials = int(config.get("hpo.trials", 50))
-    study_name = str(config.get("hpo.study_name", "xgb_hpo"))
-    use_tscv = bool(config.get("hpo.use_tscv", False))
-    n_splits = int(config.get("hpo.n_splits", 3))
+    n_trials = int(_get_nested(config, "hpo.trials", 50))
+    study_name = str(_get_nested(config, "hpo.study_name", "xgb_hpo"))
+    use_tscv = bool(_get_nested(config, "hpo.use_tscv", False))
+    n_splits = int(_get_nested(config, "hpo.n_splits", 3))
 
     logger.info(f"Starting Optuna study '{study_name}' for {n_trials} trials")
     logger.info(f"Train size: {len(X_train)}, Validation size: {len(X_val)}")
@@ -148,8 +160,8 @@ def optimize(
             return f1_score(y_val, preds, average="macro", zero_division=0)
 
     # Create or load study
-    storage = config.get("hpo.storage")
-    load_if_exists = bool(config.get("hpo.load_if_exists", False))
+    storage = _get_nested(config, "hpo.storage", None)
+    load_if_exists = bool(_get_nested(config, "hpo.load_if_exists", False))
 
     study = optuna.create_study(
         direction="maximize",
