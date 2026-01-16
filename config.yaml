@@ -74,8 +74,8 @@ training:
   # Remaining 20% is holdout (never touched until final evaluation)
 
   # Label thresholds for classification
-  buy_threshold: 0.002   # Return > 0.2% = Buy signal
-  sell_threshold: -0.002 # Return < -0.2% = Sell signal
+  buy_threshold: 0.0005   # Return > 0.05% = Buy signal
+  sell_threshold: -0.0005 # Return < -0.05% = Sell signal
 
   # Early stopping (only used when validation set provided)
   early_stopping_rounds: 20
