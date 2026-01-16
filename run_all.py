@@ -40,6 +40,12 @@ def main(config_path: Optional[Path] = None) -> None:
         logger.info(f"Processed dataset: {results['processed_path']}")
         logger.info(f"Features used: {results['features_used']}")
         logger.info("-" * 60)
+        logger.info("CLASS DISTRIBUTION:")
+        dist = results['class_distribution']
+        logger.info(f"  Sell:  {dist['sell']:.1%}")
+        logger.info(f"  Range: {dist['range']:.1%}")
+        logger.info(f"  Buy:   {dist['buy']:.1%}")
+        logger.info("-" * 60)
         logger.info("ACCURACY METRICS:")
         logger.info(f"  Train accuracy:    {results['train_accuracy']:.2%}")
         logger.info(f"  Holdout accuracy:  {results['holdout_accuracy']:.2%}")
@@ -56,6 +62,15 @@ def main(config_path: Optional[Path] = None) -> None:
             logger.warning(
                 f"Potential overfitting! Train-Holdout gap: {gap:.2%}. "
                 "Consider more regularization or more data."
+            )
+
+        # Class imbalance warning
+        dist = results['class_distribution']
+        if max(dist.values()) > 0.80:
+            dominant = max(dist, key=dist.get)
+            logger.warning(
+                f"Severe class imbalance! {dominant.capitalize()} is {dist[dominant]:.1%}. "
+                "Consider adjusting thresholds in config.yaml."
             )
 
     except FileNotFoundError as e:
