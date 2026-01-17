@@ -27,8 +27,9 @@ data_sources:
 # Model Configuration
 model:
   path: "xgb_eurusd_h1.pkl"
-  feature_count: 20  # H1 + H4 features
+  feature_count: 20  # H1 + H4 multi-timeframe features
   features:
+    # H1 features
     - close_ema50_h1
     - ema50_ema200_h1
     - rsi_h1
@@ -37,9 +38,12 @@ model:
     - adx_h1
     - body_h1
     - range_h1
+    # Time features
     - hour
     - session
+    # H1 return
     - prev_return_h1
+    # H4 features
     - close_ema50_h4
     - ema50_ema200_h4
     - rsi_h4
@@ -48,57 +52,46 @@ model:
     - adx_h4
     - body_h4
     - range_h4
+    # H4 return
     - prev_return_h4
   params:
+    # Default params - will be overridden by HPO
     max_depth: 3
     learning_rate: 0.05
-    n_estimators: 250
+    n_estimators: 150
     subsample: 0.8
     colsample_bytree: 0.8
-    min_child_weight: 4
+    min_child_weight: 5
     reg_alpha: 1.5
-    reg_lambda: 7.0
-    gamma: 0.1
+    reg_lambda: 5.0
+    gamma: 0.2
 
-# XGBoost Training Parameters
+# Training Configuration
 training:
-  n_estimators: 100
-  max_depth: 3
-  learning_rate: 0.1
-  subsample: 0.8
-  colsample_bytree: 0.8
-  reg_alpha: 1.0
-  reg_lambda: 1.0
-  min_child_weight: 3
-  gamma: 0.1
-  objective: "multi:softprob"
-  num_class: 3
-  random_state: 42
+  # Data split ratios (must sum to 1.0)
+  train_ratio: 0.6      # 60% for training
+  val_ratio: 0.2        # 20% for validation (HPO + early stopping)
+  # Remaining 20% is holdout (never touched until final evaluation)
+
+  # Label thresholds for classification
+  buy_threshold: 0.0005   # Return > 0.05% = Buy signal
+  sell_threshold: -0.0005 # Return < -0.05% = Sell signal
+
+  # Early stopping (only used when validation set provided)
   early_stopping_rounds: 20
+
+  # Legacy - kept for backwards compatibility
   test_size: 0.3
-  buy_threshold: 0.0025
-  sell_threshold: -0.0025
 
 # Hyperparameter Optimization (Optuna)
 hpo:
   enabled: true
-  n_trials: 100
-  trials: 100
+  trials: 50            # Number of HPO trials (reduced for faster iteration)
   study_name: "xgb_hpo"
-  storage: "sqlite:///hpo.db"
-  load_if_exists: true
-  direction: "maximize"  # maximize validation accuracy
-  n_splits: 5
-  parameters:
-    n_estimators: [50, 100, 200, 400]
-    max_depth: [2, 3, 4, 5, 6]
-    learning_rate: [0.01, 0.05, 0.1, 0.2]
-    subsample: [0.6, 0.7, 0.8, 0.9, 1.0]
-    colsample_bytree: [0.6, 0.7, 0.8, 0.9, 1.0]
-    reg_alpha: [0, 0.1, 0.5, 1.0, 2.0]
-    reg_lambda: [0, 0.1, 0.5, 1.0, 2.0]
-    min_child_weight: [1, 2, 3, 5, 7]
-    gamma: [0, 0.1, 0.5, 1.0]
+  storage: null         # Set to "sqlite:///hpo.db" to persist studies
+  load_if_exists: false
+  use_tscv: false       # Set true for TimeSeriesSplit within HPO
+  n_splits: 3           # Number of TSCV splits if use_tscv=true
 
 # FastAPI Server Configuration
 api:
@@ -165,7 +158,7 @@ backtesting:
 
 # Experiment Tracking (MLflow)
 mlflow:
-  enabled: true
+  enabled: false  # Disabled by default, enable when needed
   tracking_uri: "http://localhost:5000"
   experiment_name: "trading_bot_experiments"
   artifact_location: "./experiments"
@@ -195,8 +188,7 @@ notifications:
     to_email: "your_email@gmail.com"
 
 # Paths
-paths:these directories: ['/home/bobaigwa/Desktop/AdvanceProfit-EA']
-INFO:     Uvicorn running on http://
+paths:
   data_raw: "data/raw"
   data_processed: "data/processed"
   models: "models"

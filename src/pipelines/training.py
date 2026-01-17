@@ -1,8 +1,8 @@
-"""Training pipeline orchestration."""
+"""Training pipeline orchestration with proper data splitting to prevent overfitting."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,22 +24,40 @@ class PipelineResult:
     model_path: str
     train_accuracy: float
     val_accuracy: float
+    holdout_accuracy: float
     sharpe: float
     win_rate: float
     max_drawdown: float
 
 
 class TrainingPipeline:
+    """
+    Training pipeline with proper 3-way data splitting.
+
+    Data Split Strategy (prevents data leakage):
+    - Train (60%): Used for model training
+    - Validation (20%): Used for HPO and early stopping
+    - Holdout (20%): NEVER touched until final evaluation
+
+    This ensures reported metrics reflect true out-of-sample performance.
+    """
+
     def __init__(self, config: Dict[str, Any] | None = None):
-        self.config = config or get_config()._config
+        self._config_obj = get_config()
+        self.config = config or self._config_obj._config
         self.loader = DataLoader(self.config)
         self.validator = DataValidator(self.config)
         self.fe = FeatureEngineer(self.config)
         self.trainer = ModelTrainer(self.config)
 
+    def _get(self, key_path: str, default: Any = None) -> Any:
+        """Get config value using dot notation."""
+        return self._config_obj.get(key_path, default)
+
     def _label(self, df: pd.DataFrame) -> pd.DataFrame:
-        buy_th = float(self.config.get("training.buy_threshold", 0.002))
-        sell_th = float(self.config.get("training.sell_threshold", -0.002))
+        """Create trading labels based on forward returns."""
+        buy_th = float(self._get("training.buy_threshold", 0.002))
+        sell_th = float(self._get("training.sell_threshold", -0.002))
         ahead_return = df["close"].shift(-1) / df["close"] - 1
         labels = np.zeros(len(df), dtype=int)
         labels[ahead_return > buy_th] = 1
@@ -47,23 +65,130 @@ class TrainingPipeline:
         df["label"] = labels
         return df
 
+    def _get_class_distribution(self, y: np.ndarray) -> Dict[str, float]:
+        """Calculate class distribution percentages."""
+        total = len(y)
+        if total == 0:
+            return {"sell": 0.0, "range": 0.0, "buy": 0.0}
+        sell_pct = float(np.sum(y == 0) / total)
+        range_pct = float(np.sum(y == 1) / total)
+        buy_pct = float(np.sum(y == 2) / total)
+        return {"sell": sell_pct, "range": range_pct, "buy": buy_pct}
+
+    def _three_way_split(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Split data into train/validation/holdout sets.
+
+        Returns:
+            X_train, X_val, X_holdout, y_train, y_val, y_holdout
+        """
+        train_ratio = float(self._get("training.train_ratio", 0.6))
+        val_ratio = float(self._get("training.val_ratio", 0.2))
+
+        n = len(X)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+
+        X_train = X[:train_end]
+        X_val = X[train_end:val_end]
+        X_holdout = X[val_end:]
+
+        y_train = y[:train_end]
+        y_val = y[train_end:val_end]
+        y_holdout = y[val_end:]
+
+        logger.info(
+            f"Data split: Train={len(X_train)} ({train_ratio:.0%}), "
+            f"Val={len(X_val)} ({val_ratio:.0%}), "
+            f"Holdout={len(X_holdout)} ({1-train_ratio-val_ratio:.0%})"
+        )
+
+        return X_train, X_val, X_holdout, y_train, y_val, y_holdout
+
+    def _backtest_on_split(
+        self, model_path: str, df: pd.DataFrame, feature_cols: list[str], split_name: str
+    ) -> Tuple[float, float, float]:
+        """
+        Run simple backtest on a data split.
+
+        Returns:
+            sharpe, win_rate, max_drawdown
+        """
+        if len(df) < 2:
+            logger.warning(f"Insufficient data for {split_name} backtest")
+            return 0.0, 0.0, 0.0
+
+        try:
+            model = joblib.load(model_path)
+            preds = model.predict(df[feature_cols].values)
+        except Exception as e:
+            logger.error(f"Failed to load model for backtest: {e}")
+            return 0.0, 0.0, 0.0
+
+        df = df.copy()
+        df["position"] = pd.Series(preds).map({0: -1, 1: 0, 2: 1}).values
+        df["next_ret"] = df["close"].pct_change(-1) * -1
+        trading_cost = float(self._get("backtesting.commission", 0.0001))
+
+        df = df.iloc[:-1].copy()
+        if len(df) == 0:
+            return 0.0, 0.0, 0.0
+
+        df["pnl"] = df["position"] * df["next_ret"] - (df["position"] != 0).astype(float) * trading_cost
+
+        avg_pnl = float(df["pnl"].mean())
+        std_pnl = float(df["pnl"].std(ddof=1)) if len(df) > 1 else 0.0
+        sharpe = (avg_pnl / std_pnl) * np.sqrt(252) if std_pnl > 0 else 0.0
+
+        cum_curve = (1 + df["pnl"]).cumprod()
+        rolling_max = cum_curve.cummax()
+        drawdown = cum_curve / rolling_max - 1
+        max_dd = float(drawdown.min()) if len(drawdown) else 0.0
+
+        wins = int((df["pnl"] > 0).sum())
+        losses = int((df["pnl"] < 0).sum())
+        win_rate = float(wins / (wins + losses)) if (wins + losses) > 0 else 0.0
+
+        trades = int((df["position"] != 0).sum())
+        logger.info(
+            f"{split_name} Backtest | Trades: {trades} | "
+            f"Win rate: {win_rate:.2%} | Sharpe: {sharpe:.2f} | Max DD: {max_dd:.2%}"
+        )
+
+        return sharpe, win_rate, max_dd
+
     def run(self) -> Dict[str, Any]:
-        raw_path = self.config.get("paths.data_raw_file", "EURUSD_D1_raw.csv")
-        processed_path = self.config.get("paths.data_processed_file", "EURUSD_D1_clean.csv")
+        """
+        Run the complete training pipeline.
+
+        Steps:
+        1. Load and validate data
+        2. Engineer features and create labels
+        3. Split into train/validation/holdout (60/20/20)
+        4. Run HPO on train set with validation for scoring
+        5. Train final model on train+validation with early stopping
+        6. Evaluate on holdout set (never seen before)
+        """
+        raw_path = self._get("paths.data_raw_file", "EURUSD_H1_raw.csv")
+        processed_path = self._get("paths.data_processed_file", "EURUSD_H1_clean.csv")
 
         # Load and validate
+        logger.info("Loading data...")
         df = self.loader.load(raw_path)
         self.validator.validate_ohlc(df)
 
         # Features
+        logger.info("Engineering features...")
         df = self.fe.engineer(df)
         df = self._label(df)
 
         feature_cols = FeatureEngineer.default_feature_columns()
         df = df.dropna(subset=feature_cols).iloc[:-1].copy()
-        logger.info(f"Dataset after feature and label prep: {len(df)} rows, {len(feature_cols)} features")
+        logger.info(f"Dataset after prep: {len(df)} rows, {len(feature_cols)} features")
 
-        # Persist processed
+        # Persist processed data
         pd.DataFrame(df).to_csv(processed_path, index=False)
         logger.info(f"Saved processed dataset to {processed_path}")
 
@@ -71,56 +196,60 @@ class TrainingPipeline:
         X = df[feature_cols].values
         y = pd.Series(df["label"]).map({-1: 0, 0: 1, 1: 2}).values
 
-        # HPO (optional)
-        if bool(self.config.get("hpo.enabled", True)):
-            X_train = X[: int(len(X) * (1 - float(self.config.get("training.test_size", 0.3))))]
-            y_train = y[: len(X_train)]
-            best_params, best_val = hpo_optimize(X_train, y_train, self.config)
+        # Log class distribution
+        class_dist = self._get_class_distribution(y)
+        logger.info(
+            f"Class distribution: Sell={class_dist['sell']:.1%}, "
+            f"Range={class_dist['range']:.1%}, Buy={class_dist['buy']:.1%}"
+        )
+
+        # 3-way split
+        X_train, X_val, X_holdout, y_train, y_val, y_holdout = self._three_way_split(X, y)
+
+        # HPO on train set, validated on validation set
+        if bool(self._get("hpo.enabled", True)):
+            logger.info("Running hyperparameter optimization...")
+            best_params, best_val = hpo_optimize(X_train, y_train, X_val, y_val, self.config)
             self.config.setdefault("model", {}).setdefault("params", {}).update(best_params)
-            logger.info("Updated config with best HPO params for training stage")
+            logger.info(f"HPO complete. Best validation F1: {best_val:.4f}")
 
-        # Train
-        result: TrainResult = self.trainer.train(X, y, feature_cols)
+        # Train final model on train+validation (holdout never touched)
+        X_train_final = np.vstack([X_train, X_val])
+        y_train_final = np.concatenate([y_train, y_val])
 
-        # Simple backtest on validation segment
-        test_size = float(self.config.get("training.test_size", 0.3))
-        split_idx = int(len(X) * (1 - test_size))
-        val_df = df.iloc[split_idx:].copy()
-        y_val_true = pd.Series(val_df["label"]).map({-1: 0, 0: 1, 1: 2}).values
-        try:
-            preds_val = result and joblib.load(result.model_path).predict(val_df[feature_cols].values)
-        except Exception:
-            preds_val = None
+        logger.info("Training final model on train+validation data...")
+        result: TrainResult = self.trainer.train(
+            X_train_final, y_train_final, feature_cols, X_val=None, y_val=None
+        )
 
-        sharpe = 0.0
-        win_rate = 0.0
-        max_dd = 0.0
-        if preds_val is not None and len(preds_val) == len(val_df):
-            val_df["position"] = pd.Series(preds_val).map({0: -1, 1: 0, 2: 1}).values
-            val_df["next_ret"] = val_df["close"].pct_change(-1) * -1
-            trading_cost = float(self.config.get("backtest.trading_cost", 0.0001))
-            val_df = val_df.iloc[:-1].copy()
-            val_df["pnl"] = val_df["position"] * val_df["next_ret"] - (val_df["position"] != 0).astype(float) * trading_cost
-            avg_pnl = float(val_df["pnl"].mean()) if len(val_df) else 0.0
-            std_pnl = float(val_df["pnl"].std(ddof=1)) if len(val_df) > 1 else 0.0
-            sharpe = (avg_pnl / std_pnl) * np.sqrt(252) if std_pnl > 0 else 0.0
-            cum_curve = (1 + val_df["pnl"]).cumprod()
-            rolling_max = cum_curve.cummax()
-            drawdown = cum_curve / rolling_max - 1
-            max_dd = float(drawdown.min()) if len(drawdown) else 0.0
-            wins = int((val_df["pnl"] > 0).sum())
-            losses = int((val_df["pnl"] < 0).sum())
-            win_rate = float(wins / (wins + losses)) if (wins + losses) > 0 else 0.0
-            logger.info(f"Backtest | Trades: {(val_df['position'] != 0).sum()} | Win rate: {win_rate:.2%} | Sharpe: {sharpe:.2f} | Max DD: {max_dd:.2%}")
+        # Evaluate on holdout (TRUE out-of-sample performance)
+        logger.info("Evaluating on holdout set (true out-of-sample)...")
+        model = joblib.load(result.model_path)
+        holdout_preds = model.predict(X_holdout)
+        holdout_accuracy = float(np.mean(holdout_preds == y_holdout))
+        logger.info(f"Holdout accuracy: {holdout_accuracy:.2%}")
+
+        # Calculate split indices for backtest
+        train_ratio = float(self._get("training.train_ratio", 0.6))
+        val_ratio = float(self._get("training.val_ratio", 0.2))
+        n = len(df)
+        val_end = int(n * (train_ratio + val_ratio))
+
+        holdout_df = df.iloc[val_end:].copy()
+        sharpe, win_rate, max_dd = self._backtest_on_split(
+            result.model_path, holdout_df, feature_cols, "Holdout"
+        )
 
         return {
             "model_path": result.model_path,
             "train_accuracy": result.train_accuracy,
             "val_accuracy": result.val_accuracy,
+            "holdout_accuracy": holdout_accuracy,
             "feature_names": result.feature_names,
             "features_used": feature_cols,
             "processed_path": processed_path,
             "sharpe": sharpe,
             "win_rate": win_rate,
             "max_drawdown": max_dd,
+            "class_distribution": class_dist,
         }

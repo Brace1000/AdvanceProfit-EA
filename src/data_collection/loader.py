@@ -36,14 +36,27 @@ class DataLoader:
         if removed > 0:
             logger.info(f"Removed {removed} rows with invalid price data")
         # Normalize/parse time column if present
-        for time_col in ["time", "date", "datetime", "timestamp"]:
+        time_col_found = None
+        for time_col in ["time", "date", "datetime", "timestamp", "price"]:
             if time_col in df.columns:
                 try:
-                    df[time_col] = pd.to_datetime(df[time_col])
-                    df = df.sort_values(time_col).reset_index(drop=True)
-                    break
+                    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+                    # Check if conversion was successful
+                    if df[time_col].notna().sum() > len(df) * 0.5:
+                        time_col_found = time_col
+                        break
                 except Exception:
                     pass
+
+        if time_col_found:
+            # Drop rows where datetime parsing failed
+            df = df.dropna(subset=[time_col_found])
+            # Rename to standard "time" column if needed
+            if time_col_found != "time":
+                df = df.rename(columns={time_col_found: "time"})
+                logger.debug(f"Renamed '{time_col_found}' column to 'time'")
+            df = df.sort_values("time").reset_index(drop=True)
+
         return df
 
     def load(self, raw_path: Path) -> pd.DataFrame:
