@@ -33,7 +33,7 @@ Before running the EA, make sure your API is running:
 ```bash
 # Terminal 1: Start the API
 cd ~/Desktop/AdvanceProfit-EA
-uvicorn main:app --reload
+uvicorn main:app --reloaduvicorn main:app --reloaduvicorn main:app --reload
 ```
 
 Verify it's running by opening: `http://127.0.0.1:8000/health`

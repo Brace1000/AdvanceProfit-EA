@@ -25,7 +25,7 @@ mlflow = "^2.19.0"
 # Data Collection
 yfinance = "^0.2.50"
 ccxt = "^4.4.40"
-MetaTrader5 = "^5.0.4563"
+# MetaTrader5 = "^5.0.4563"  # Windows-only, not used on Linux
 
 # Backtesting
 backtrader = "^1.9.78"
