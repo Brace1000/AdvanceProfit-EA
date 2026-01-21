@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Set
 
 import numpy as np
 import pandas as pd
 import joblib
+from scipy.stats import spearmanr
 
 from src.config import get_config
 from src.logger import get_logger
@@ -75,6 +76,60 @@ class TrainingPipeline:
         buy_pct = float(np.sum(y == 2) / total)
         return {"sell": sell_pct, "range": range_pct, "buy": buy_pct}
 
+    def _prune_correlated_features(
+        self, df: pd.DataFrame, feature_cols: list[str], threshold: float = 0.85
+    ) -> list[str]:
+        """
+        Remove highly correlated features using Spearman correlation.
+
+        When two features have correlation > threshold, drops the second one.
+        Prioritizes keeping regime features (if implemented) over raw price features.
+
+        Args:
+            df: DataFrame with all features
+            feature_cols: List of feature column names
+            threshold: Spearman correlation threshold (default 0.85)
+
+        Returns:
+            Pruned list of feature columns
+        """
+        logger.info(f"Running Spearman correlation analysis (threshold={threshold})...")
+
+        # Compute Spearman correlation matrix
+        X = df[feature_cols].values
+        corr_matrix = np.zeros((len(feature_cols), len(feature_cols)))
+
+        for i in range(len(feature_cols)):
+            for j in range(i + 1, len(feature_cols)):
+                corr, _ = spearmanr(X[:, i], X[:, j], nan_policy='omit')
+                corr_matrix[i, j] = abs(corr)
+                corr_matrix[j, i] = abs(corr)
+
+        # Find correlated pairs
+        to_drop: Set[str] = set()
+        for i in range(len(feature_cols)):
+            if feature_cols[i] in to_drop:
+                continue
+            for j in range(i + 1, len(feature_cols)):
+                if feature_cols[j] in to_drop:
+                    continue
+                if corr_matrix[i, j] > threshold:
+                    # Drop the second feature in the pair
+                    logger.info(
+                        f"  Dropping '{feature_cols[j]}' (corr={corr_matrix[i, j]:.3f} "
+                        f"with '{feature_cols[i]}')"
+                    )
+                    to_drop.add(feature_cols[j])
+
+        pruned_features = [f for f in feature_cols if f not in to_drop]
+
+        logger.info(
+            f"Correlation pruning complete: {len(feature_cols)} → {len(pruned_features)} features "
+            f"(dropped {len(to_drop)})"
+        )
+
+        return pruned_features
+
     def _three_way_split(
         self, X: np.ndarray, y: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -128,7 +183,8 @@ class TrainingPipeline:
             return 0.0, 0.0, 0.0
 
         df = df.copy()
-        df["position"] = pd.Series(preds).map({0: -1, 1: 0, 2: 1}).values
+        # Fix: Ensure predictions are aligned with df index
+        df["position"] = pd.Series(preds, index=df.index).map({0: -1, 1: 0, 2: 1})
         df["next_ret"] = df["close"].pct_change(-1) * -1
         trading_cost = float(self._get("backtesting.commission", 0.0001))
 
@@ -187,6 +243,10 @@ class TrainingPipeline:
         feature_cols = FeatureEngineer.default_feature_columns()
         df = df.dropna(subset=feature_cols).iloc[:-1].copy()
         logger.info(f"Dataset after prep: {len(df)} rows, {len(feature_cols)} features")
+
+        # Correlation pruning
+        correlation_threshold = float(self._get("training.correlation_threshold", 0.85))
+        feature_cols = self._prune_correlated_features(df, feature_cols, correlation_threshold)
 
         # Persist processed data
         pd.DataFrame(df).to_csv(processed_path, index=False)
