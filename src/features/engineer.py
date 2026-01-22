@@ -97,6 +97,20 @@ class FeatureEngineer:
             logger.debug(f"Applying shift(1) to {len(ts_features)} time-series features")
             df[ts_features] = df[ts_features].shift(1)
 
+        # ADDITIONAL LAG for inherently lagging indicators
+        # These features use smoothed/averaged values, so they're backward-looking
+        # Extra shift helps model learn them as they appear in real-time (with delay)
+        lagging_indicators = [
+            "ema50_ema200_h1", "ema50_ema200_h4",  # EMA crossovers
+            "rsi_slope_h1", "rsi_slope_h4",         # RSI slopes
+            "z_close_h1", "z_close_h4"              # Z-scores (100-bar lookback)
+        ]
+        lagging_present = [f for f in lagging_indicators if f in df.columns]
+
+        if lagging_present:
+            logger.debug(f"Applying additional shift(1) to {len(lagging_present)} lagging indicators")
+            df[lagging_present] = df[lagging_present].shift(1)
+
         # Reset index
         df = df.reset_index()
 

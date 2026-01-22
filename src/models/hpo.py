@@ -52,10 +52,10 @@ def suggest_params(trial: optuna.trial.Trial) -> Dict[str, Any]:
         "subsample": trial.suggest_float("subsample", 0.6, 0.9),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
 
-        # Regularization - strong regularization to prevent overfitting
+        # Regularization - VERY strong regularization to prevent overfitting
         "gamma": trial.suggest_float("gamma", 0.1, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 5.0),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 10.0, log=True),
+        "reg_alpha": trial.suggest_float("reg_alpha", 10.0, 100.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 10.0, 100.0, log=True),
 
         # Fixed parameters
         "objective": "multi:softprob",

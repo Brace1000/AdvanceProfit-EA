@@ -69,8 +69,8 @@ model:
     subsample: 0.8
     colsample_bytree: 0.8
     min_child_weight: 5
-    reg_alpha: 1.5
-    reg_lambda: 5.0
+    reg_alpha: 30.0    # Increased to combat overfitting
+    reg_lambda: 30.0   # Increased to combat overfitting
     gamma: 0.2
 
 # Training Configuration
@@ -81,12 +81,19 @@ training:
   # Remaining 20% is holdout (never touched until final evaluation)
 
   # Label thresholds for classification
-  use_adaptive_labels: true     # Use volatility-adjusted thresholds (recommended)
+  # Triple Barrier Method (recommended for profitable trading)
+  use_triple_barrier: true      # Use TP/SL/Time barriers (overrides adaptive/fixed)
+  tp_pips: 15.0                 # Profit target in pips
+  sl_pips: 10.0                 # Stop loss in pips (gives 1.5:1 R/R)
+  max_horizon_bars: 24          # Max bars to hold position (24h for H1 data)
+
+  # Volatility-adjusted thresholds (legacy, disabled when triple_barrier=true)
+  use_adaptive_labels: false    # Use volatility-adjusted thresholds
   atr_multiplier: 0.75          # Threshold = ATR * multiplier (0.75 is optimal for H1)
   adaptive_lookback: 24         # Hours to average ATR over (only if adaptive)
   min_threshold_pips: 3.0       # Minimum threshold in pips (spread floor)
 
-  # Fixed thresholds (only used if use_adaptive_labels=false)
+  # Fixed thresholds (only used if both triple_barrier and adaptive are false)
   buy_threshold: 0.0005   # Return > 0.05% = Buy signal
   sell_threshold: -0.0005 # Return < -0.05% = Sell signal
 
