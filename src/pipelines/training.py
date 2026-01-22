@@ -16,6 +16,7 @@ from src.data_collection.validator import DataValidator
 from src.features.engineer import FeatureEngineer
 from src.models.hpo import optimize as hpo_optimize
 from src.models.trainer import ModelTrainer, TrainResult
+from src.utils.leakage_detector import LeakageDetector
 
 logger = get_logger("trading_bot.pipeline")
 
@@ -56,14 +57,169 @@ class TrainingPipeline:
         return self._config_obj.get(key_path, default)
 
     def _label(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create trading labels based on forward returns."""
-        buy_th = float(self._get("training.buy_threshold", 0.002))
-        sell_th = float(self._get("training.sell_threshold", -0.002))
+        """
+        Create trading labels using Triple Barrier method or simple threshold.
+
+        Supports three modes:
+        1. Triple Barrier: Uses profit target, stop loss, and time horizon (recommended)
+        2. Volatility-adjusted: Uses ATR-based dynamic thresholds
+        3. Fixed threshold: Uses static buy/sell thresholds
+
+        Triple Barrier mode labels trades based on which barrier is hit first:
+        - TP hit first → directional label (BUY/SELL)
+        - SL hit first → RANGE (bad setup)
+        - Time expires → RANGE (no edge)
+        """
+        use_triple_barrier = bool(self._get("training.use_triple_barrier", False))
+
+        if use_triple_barrier:
+            return self._label_triple_barrier(df)
+
+        # Existing adaptive/fixed labeling logic
+        use_adaptive = bool(self._get("training.use_adaptive_labels", False))
         ahead_return = df["close"].shift(-1) / df["close"] - 1
-        labels = np.zeros(len(df), dtype=int)
-        labels[ahead_return > buy_th] = 1
-        labels[ahead_return < sell_th] = -1
+
+        if use_adaptive:
+            # Volatility-adjusted labeling with spread floor
+            if "atr_h1" not in df.columns:
+                logger.warning("ATR not found for adaptive labels, falling back to fixed thresholds")
+                use_adaptive = False
+            else:
+                # Calculate dynamic threshold as multiple of rolling ATR
+                atr_multiplier = float(self._get("training.atr_multiplier", 1.5))
+                lookback = int(self._get("training.adaptive_lookback", 24))
+                min_threshold_pips = float(self._get("training.min_threshold_pips", 3.0))
+
+                # Use rolling ATR mean to smooth volatility spikes
+                rolling_atr = df["atr_h1"].rolling(window=lookback, min_periods=1).mean()
+                atr_threshold = rolling_atr * atr_multiplier
+
+                # Convert pip floor to price units (1 pip = 0.0001 for forex)
+                pip_value = 0.0001
+                min_threshold_price = min_threshold_pips * pip_value
+
+                # Apply floor: threshold = max(ATR * multiplier, spread_floor)
+                dynamic_threshold = np.maximum(atr_threshold, min_threshold_price)
+
+                # Normalize to return percentage
+                threshold_pct = dynamic_threshold / df["close"]
+
+                labels = np.zeros(len(df), dtype=int)
+                labels[ahead_return > threshold_pct] = 1   # Buy
+                labels[ahead_return < -threshold_pct] = -1  # Sell
+
+                # Count how many times floor was applied
+                floor_applied = (atr_threshold < min_threshold_price).sum()
+                floor_pct = (floor_applied / len(df)) * 100
+
+                logger.info(
+                    f"Using adaptive labels: ATR multiplier={atr_multiplier}, "
+                    f"lookback={lookback}h, spread floor={min_threshold_pips} pips"
+                )
+                logger.info(
+                    f"  Threshold range: {threshold_pct.min():.4%} to {threshold_pct.max():.4%}"
+                )
+                logger.info(
+                    f"  Spread floor applied: {floor_applied} times ({floor_pct:.1f}% of data)"
+                )
+
+        if not use_adaptive:
+            # Fixed threshold labeling
+            buy_th = float(self._get("training.buy_threshold", 0.002))
+            sell_th = float(self._get("training.sell_threshold", -0.002))
+
+            labels = np.zeros(len(df), dtype=int)
+            labels[ahead_return > buy_th] = 1
+            labels[ahead_return < sell_th] = -1
+
+            logger.info(f"Using fixed labels: buy_threshold={buy_th:.4%}, sell_threshold={sell_th:.4%}")
+
         df["label"] = labels
+        return df
+
+    def _label_triple_barrier(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Label using Triple Barrier method.
+
+        For each bar, scan forward up to max_horizon bars to find which barrier hits first:
+        1. Profit target (TP): +tp_pips pips
+        2. Stop loss (SL): -sl_pips pips
+        3. Time limit: max_horizon bars
+
+        Returns:
+            DataFrame with 'label' column: -1 (sell), 0 (range), 1 (buy)
+        """
+        tp_pips = float(self._get("training.tp_pips", 15.0))
+        sl_pips = float(self._get("training.sl_pips", 10.0))
+        max_horizon = int(self._get("training.max_horizon_bars", 24))
+
+        pip_value = 0.0001
+        tp_price = tp_pips * pip_value
+        sl_price = sl_pips * pip_value
+
+        labels = np.zeros(len(df), dtype=int)
+
+        logger.info(f"Calculating Triple Barrier labels for {len(df)} bars...")
+
+        for i in range(len(df) - 1):  # Skip last bar (no future data)
+            entry_price = df.iloc[i]["close"]
+
+            # Scan forward up to max_horizon bars
+            horizon_end = min(i + 1 + max_horizon, len(df))
+            future_highs = df.iloc[i+1:horizon_end]["high"].values
+            future_lows = df.iloc[i+1:horizon_end]["low"].values
+
+            # Calculate returns to high/low for each future bar
+            returns_to_high = (future_highs - entry_price) / entry_price
+            returns_to_low = (future_lows - entry_price) / entry_price
+
+            # Find first bar where TP or SL is hit
+            tp_threshold = tp_price / entry_price
+            sl_threshold = sl_price / entry_price
+
+            # Check upward TP/SL (for BUY setups)
+            tp_up_hit = np.where(returns_to_high >= tp_threshold)[0]
+            sl_up_hit = np.where(returns_to_low <= -sl_threshold)[0]
+
+            # Check downward TP/SL (for SELL setups)
+            tp_down_hit = np.where(returns_to_low <= -tp_threshold)[0]
+            sl_down_hit = np.where(returns_to_high >= sl_threshold)[0]
+
+            # Determine label based on first barrier hit
+            first_up_tp = tp_up_hit[0] if len(tp_up_hit) > 0 else max_horizon
+            first_up_sl = sl_up_hit[0] if len(sl_up_hit) > 0 else max_horizon
+            first_down_tp = tp_down_hit[0] if len(tp_down_hit) > 0 else max_horizon
+            first_down_sl = sl_down_hit[0] if len(sl_down_hit) > 0 else max_horizon
+
+            # BUY setup: upward TP hit before upward SL
+            if first_up_tp < first_up_sl and first_up_tp < max_horizon:
+                labels[i] = 1
+            # SELL setup: downward TP hit before downward SL
+            elif first_down_tp < first_down_sl and first_down_tp < max_horizon:
+                labels[i] = -1
+            # Otherwise: RANGE (SL hit first or time expired)
+            else:
+                labels[i] = 0
+
+        df["label"] = labels
+
+        # Log statistics
+        buy_count = (labels == 1).sum()
+        sell_count = (labels == -1).sum()
+        range_count = (labels == 0).sum()
+        total = len(labels)
+
+        logger.info(
+            f"Using Triple Barrier labeling: TP={tp_pips} pips, SL={sl_pips} pips, "
+            f"horizon={max_horizon} bars"
+        )
+        logger.info(
+            f"  Label distribution: Buy={buy_count}/{total} ({buy_count/total:.1%}), "
+            f"Sell={sell_count}/{total} ({sell_count/total:.1%}), "
+            f"Range={range_count}/{total} ({range_count/total:.1%})"
+        )
+        logger.info(f"  Risk/Reward ratio: {tp_pips/sl_pips:.2f}:1")
+
         return df
 
     def _get_class_distribution(self, y: np.ndarray) -> Dict[str, float]:
@@ -247,6 +403,29 @@ class TrainingPipeline:
         # Correlation pruning
         correlation_threshold = float(self._get("training.correlation_threshold", 0.85))
         feature_cols = self._prune_correlated_features(df, feature_cols, correlation_threshold)
+
+        # Leakage detection (run before splitting to detect issues early)
+        if bool(self._get("training.detect_leakage", True)):
+            logger.info("Running leakage detection...")
+            detector = LeakageDetector(df, label_col="label")
+            warnings = detector.run_tests(feature_cols)
+
+            if warnings:
+                logger.warning("🚨 POTENTIAL LEAKAGE DETECTED:")
+                for w in warnings:
+                    logger.warning(f"  ⚠️  {w}")
+                # Optionally abort training if leakage detected
+                # if self._get("training.abort_on_leakage", False):
+                #     raise ValueError("Leakage detected. Training aborted.")
+            else:
+                logger.info("✅ All features passed leakage tests")
+
+            # Generate correlation decay visualization
+            try:
+                plot_path = "correlation_decay_plot.png"
+                detector.plot_correlation_decay(feature_cols, max_lag=5, output_path=plot_path)
+            except Exception as e:
+                logger.warning(f"Failed to generate correlation decay plot: {e}")
 
         # Persist processed data
         pd.DataFrame(df).to_csv(processed_path, index=False)

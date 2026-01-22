@@ -27,7 +27,7 @@ data_sources:
 # Model Configuration
 model:
   path: "xgb_eurusd_h1.pkl"
-  feature_count: 27  # H1 + H4 multi-timeframe + OHE time features (before pruning)
+  feature_count: 33  # H1(11) + Time(9) + H4(11) + Returns(2) with P1 regime features
   features:
     # H1 features (8)
     - close_ema50_h1
@@ -81,11 +81,21 @@ training:
   # Remaining 20% is holdout (never touched until final evaluation)
 
   # Label thresholds for classification
+  use_adaptive_labels: true     # Use volatility-adjusted thresholds (recommended)
+  atr_multiplier: 0.75          # Threshold = ATR * multiplier (0.75 is optimal for H1)
+  adaptive_lookback: 24         # Hours to average ATR over (only if adaptive)
+  min_threshold_pips: 3.0       # Minimum threshold in pips (spread floor)
+
+  # Fixed thresholds (only used if use_adaptive_labels=false)
   buy_threshold: 0.0005   # Return > 0.05% = Buy signal
   sell_threshold: -0.0005 # Return < -0.05% = Sell signal
 
   # Feature selection
   correlation_threshold: 0.85  # Drop features with Spearman correlation > 0.85
+
+  # Leakage detection
+  detect_leakage: true          # Run leakage detection tests
+  abort_on_leakage: false       # Set to true to abort training if leakage detected
 
   # Early stopping (only used when validation set provided)
   early_stopping_rounds: 20

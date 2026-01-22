@@ -85,10 +85,21 @@ class FeatureEngineer:
         # Add time-based features
         df = self._add_time_features(df)
 
+        # ANTI-LEAKAGE: Shift all non-calendar features by 1
+        # This ensures feature[t] can only predict label[t+1], not label[t]
+        calendar_features = ["hour", "session_asian", "session_european", "session_american",
+                           "dow_monday", "dow_tuesday", "dow_wednesday", "dow_thursday", "dow_friday"]
+
+        feature_cols = self.default_feature_columns()
+        ts_features = [f for f in feature_cols if f not in calendar_features and f in df.columns]
+
+        if ts_features:
+            logger.debug(f"Applying shift(1) to {len(ts_features)} time-series features")
+            df[ts_features] = df[ts_features].shift(1)
+
         # Reset index
         df = df.reset_index()
 
-        feature_cols = self.default_feature_columns()
         logger.info(f"Created {len(feature_cols)} features")
 
         return df
@@ -101,12 +112,24 @@ class FeatureEngineer:
         df = self._adx_like(df, suffix)
         df = self._candle(df, suffix)
         df = self._returns(df, suffix)
+
+        # P1 regime detection features
+        df = self._squeeze_ratio(df, suffix)
+        df = self._choppiness(df, suffix)
+        df = self._z_score_price(df, suffix)
+
         return df
 
     def _add_h4_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add H4 timeframe features by resampling H1 data."""
-        # Resample H1 to H4
-        h4 = df[["open", "high", "low", "close"]].resample("4h").agg({
+        """
+        Add H4 timeframe features by resampling H1 data.
+
+        CRITICAL: Uses shift(1) to prevent look-ahead bias. At time T (H1),
+        we only see H4 features from the *completed* H4 bar, not the bar
+        currently in progress.
+        """
+        # Resample H1 to H4 (default label='left' means bar labeled 12:00 covers 12:00-16:00)
+        h4 = df[["open", "high", "low", "close"]].resample("4h", label="left").agg({
             "open": "first",
             "high": "max",
             "low": "min",
@@ -118,6 +141,11 @@ class FeatureEngineer:
 
         # Calculate features on H4 data
         h4 = self._calculate_features(h4, suffix="_h4")
+
+        # ANTI-LEAKAGE: Shift H4 features by 1 period
+        # This ensures at 13:00 H1, we see the H4 bar from 08:00 (08:00-12:00, completed)
+        # NOT the bar from 12:00 (12:00-16:00, still in progress)
+        h4 = h4.shift(1)
 
         # Forward-fill H4 features to H1 timeframe
         h4_features = [c for c in h4.columns if c.endswith("_h4")]
@@ -214,15 +242,96 @@ class FeatureEngineer:
         df[f"prev_return{suffix}"] = df["close"].pct_change()
         return df
 
+    def _squeeze_ratio(self, df: pd.DataFrame, suffix: str = "", bb_period: int = 20, kc_period: int = 20) -> pd.DataFrame:
+        """
+        Calculate Squeeze Ratio (Bollinger Band width / Keltner Channel width).
+
+        Low values (<1.0) indicate "squeeze" - market compression before breakout.
+        High values (>1.0) indicate expansion.
+
+        ANTI-LEAKAGE: Uses only backward-looking rolling windows.
+        """
+        # Bollinger Bands width (2 std devs)
+        bb_mid = df["close"].rolling(window=bb_period, min_periods=bb_period).mean()
+        bb_std = df["close"].rolling(window=bb_period, min_periods=bb_period).std()
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        bb_width = bb_upper - bb_lower
+
+        # Keltner Channel width (ATR-based)
+        if f"atr{suffix}" not in df.columns:
+            logger.warning(f"ATR not found for squeeze ratio{suffix}, skipping")
+            return df
+
+        kc_atr = df[f"atr{suffix}"].rolling(window=kc_period, min_periods=kc_period).mean()
+        kc_width = kc_atr * 2  # Standard KC multiplier
+
+        # Squeeze ratio
+        df[f"squeeze_ratio{suffix}"] = bb_width / (kc_width + 1e-10)
+
+        return df
+
+    def _choppiness(self, df: pd.DataFrame, suffix: str = "", period: int = 14) -> pd.DataFrame:
+        """
+        Calculate Choppiness Index.
+
+        Values near 100 = choppy/ranging market
+        Values near 0 = trending market
+
+        ANTI-LEAKAGE: Uses only backward-looking rolling sums and max/min.
+        """
+        # True range (already calculated for ATR)
+        high_low = df["high"] - df["low"]
+        high_close = np.abs(df["high"] - df["close"].shift(1))
+        low_close = np.abs(df["low"] - df["close"].shift(1))
+        tr = np.maximum(high_low, np.maximum(high_close, low_close))
+
+        # Sum of true range over period
+        tr_sum = tr.rolling(window=period, min_periods=period).sum()
+
+        # Price range (high - low) over period
+        high_max = df["high"].rolling(window=period, min_periods=period).max()
+        low_min = df["low"].rolling(window=period, min_periods=period).min()
+        price_range = high_max - low_min
+
+        # Choppiness index formula
+        chop = 100 * np.log10(tr_sum / (price_range + 1e-10)) / np.log10(period)
+
+        df[f"choppiness{suffix}"] = chop.clip(0, 100)  # Bound to [0, 100]
+
+        return df
+
+    def _z_score_price(self, df: pd.DataFrame, suffix: str = "", lookback: int = 100) -> pd.DataFrame:
+        """
+        Calculate causal Z-score for close price.
+
+        Z-score = (price - rolling_mean) / rolling_std
+
+        ANTI-LEAKAGE: Uses only backward-looking rolling statistics.
+        Each bar only knows the mean/std of the PAST lookback bars.
+        """
+        rolling_mean = df["close"].rolling(window=lookback, min_periods=lookback).mean()
+        rolling_std = df["close"].rolling(window=lookback, min_periods=lookback).std()
+
+        z_score = (df["close"] - rolling_mean) / (rolling_std + 1e-10)
+
+        # Clip extreme outliers for robustness
+        df[f"z_close{suffix}"] = z_score.clip(-5, 5)
+
+        return df
+
     @staticmethod
     def default_feature_columns() -> list[str]:
         """
-        Return list of 27 feature column names with OHE for categorical variables.
+        Return list of feature column names with OHE and P1 regime features.
 
-        Note: 'session' and 'day_of_week' are now one-hot encoded.
+        Includes:
+        - H1/H4 technical indicators
+        - Time context (OHE for sessions and days)
+        - P1 regime features (squeeze, choppiness, z-score)
         """
         return [
-            # H1 features (8)
+            # H1 features (11): technical + regime
             "close_ema50_h1",
             "ema50_ema200_h1",
             "rsi_h1",
@@ -231,6 +340,9 @@ class FeatureEngineer:
             "adx_h1",
             "body_h1",
             "range_h1",
+            "squeeze_ratio_h1",     # P1: Volatility compression
+            "choppiness_h1",        # P1: Trend vs range
+            "z_close_h1",           # P1: Price level normalization
             # Time features (9): hour + 3 sessions + 5 days
             "hour",
             "session_asian",
@@ -243,7 +355,7 @@ class FeatureEngineer:
             "dow_friday",
             # H1 return (1)
             "prev_return_h1",
-            # H4 features (8)
+            # H4 features (11): technical + regime
             "close_ema50_h4",
             "ema50_ema200_h4",
             "rsi_h4",
@@ -252,6 +364,9 @@ class FeatureEngineer:
             "adx_h4",
             "body_h4",
             "range_h4",
+            "squeeze_ratio_h4",     # P1: Volatility compression
+            "choppiness_h4",        # P1: Trend vs range
+            "z_close_h4",           # P1: Price level normalization
             # H4 return (1)
             "prev_return_h4",
         ]
