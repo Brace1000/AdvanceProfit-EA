@@ -103,3 +103,7 @@ bfg.jar
 *.zip
 *.tar.gz
 *.rar
+
+
+
+*.xgb_eurusd_h1.pkl

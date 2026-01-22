@@ -129,20 +129,38 @@ class FeatureEngineer:
         return df
 
     def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add time-based features (hour, session)."""
+        """Add time-based features with One-Hot Encoding for categorical variables."""
         if isinstance(df.index, pd.DatetimeIndex):
             df["hour"] = df.index.hour
 
-            # Session: 0=Asian, 1=European, 2=American
-            # Asian: 0-8 UTC, European: 8-16 UTC, American: 16-24 UTC
-            df["session"] = pd.cut(
+            # Session mapping: Asian: 0-8 UTC, European: 8-16 UTC, American: 16-24 UTC
+            session_raw = pd.cut(
                 df.index.hour,
                 bins=[-1, 8, 16, 24],
-                labels=[0, 1, 2]
-            ).astype(int)
+                labels=["asian", "european", "american"]
+            )
+
+            # One-hot encode sessions (no drop_first for clear feature importance)
+            df["session_asian"] = (session_raw == "asian").astype(int)
+            df["session_european"] = (session_raw == "european").astype(int)
+            df["session_american"] = (session_raw == "american").astype(int)
+
+            # Day of week (0=Monday, 4=Friday)
+            day_raw = df.index.dayofweek
+
+            # One-hot encode day of week (Monday-Friday only, trading days)
+            df["dow_monday"] = (day_raw == 0).astype(int)
+            df["dow_tuesday"] = (day_raw == 1).astype(int)
+            df["dow_wednesday"] = (day_raw == 2).astype(int)
+            df["dow_thursday"] = (day_raw == 3).astype(int)
+            df["dow_friday"] = (day_raw == 4).astype(int)
         else:
             df["hour"] = 0
-            df["session"] = 0
+            # Default to all zeros if no datetime index
+            for session in ["asian", "european", "american"]:
+                df[f"session_{session}"] = 0
+            for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+                df[f"dow_{day}"] = 0
 
         return df
 
@@ -199,9 +217,9 @@ class FeatureEngineer:
     @staticmethod
     def default_feature_columns() -> list[str]:
         """
-        Return list of 20 feature column names matching what the EA sends.
+        Return list of 27 feature column names with OHE for categorical variables.
 
-        Order must match EA's feature order exactly.
+        Note: 'session' and 'day_of_week' are now one-hot encoded.
         """
         return [
             # H1 features (8)
@@ -213,9 +231,16 @@ class FeatureEngineer:
             "adx_h1",
             "body_h1",
             "range_h1",
-            # Time features (2)
+            # Time features (9): hour + 3 sessions + 5 days
             "hour",
-            "session",
+            "session_asian",
+            "session_european",
+            "session_american",
+            "dow_monday",
+            "dow_tuesday",
+            "dow_wednesday",
+            "dow_thursday",
+            "dow_friday",
             # H1 return (1)
             "prev_return_h1",
             # H4 features (8)

@@ -27,9 +27,9 @@ data_sources:
 # Model Configuration
 model:
   path: "xgb_eurusd_h1.pkl"
-  feature_count: 20  # H1 + H4 multi-timeframe features
+  feature_count: 27  # H1 + H4 multi-timeframe + OHE time features (before pruning)
   features:
-    # H1 features
+    # H1 features (8)
     - close_ema50_h1
     - ema50_ema200_h1
     - rsi_h1
@@ -38,12 +38,19 @@ model:
     - adx_h1
     - body_h1
     - range_h1
-    # Time features
+    # Time features (9): hour + 3 sessions + 5 days
     - hour
-    - session
-    # H1 return
+    - session_asian
+    - session_european
+    - session_american
+    - dow_monday
+    - dow_tuesday
+    - dow_wednesday
+    - dow_thursday
+    - dow_friday
+    # H1 return (1)
     - prev_return_h1
-    # H4 features
+    # H4 features (8)
     - close_ema50_h4
     - ema50_ema200_h4
     - rsi_h4
@@ -52,7 +59,7 @@ model:
     - adx_h4
     - body_h4
     - range_h4
-    # H4 return
+    # H4 return (1)
     - prev_return_h4
   params:
     # Default params - will be overridden by HPO
@@ -76,6 +83,9 @@ training:
   # Label thresholds for classification
   buy_threshold: 0.0005   # Return > 0.05% = Buy signal
   sell_threshold: -0.0005 # Return < -0.05% = Sell signal
+
+  # Feature selection
+  correlation_threshold: 0.85  # Drop features with Spearman correlation > 0.85
 
   # Early stopping (only used when validation set provided)
   early_stopping_rounds: 20
