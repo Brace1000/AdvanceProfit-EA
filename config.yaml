@@ -104,6 +104,10 @@ training:
   detect_leakage: true          # Run leakage detection tests
   abort_on_leakage: false       # Set to true to abort training if leakage detected
 
+  # Probability calibration
+  use_probability_calibration: true   # Calibrate probabilities for better decision-making
+  calibration_method: "isotonic"      # 'isotonic' or 'sigmoid' (isotonic better for trees)
+
   # Early stopping (only used when validation set provided)
   early_stopping_rounds: 20
 

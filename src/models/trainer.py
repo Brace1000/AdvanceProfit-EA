@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 import xgboost as xgb
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.calibration import CalibratedClassifierCV
 
 from src.logger import get_logger
 
@@ -137,13 +138,20 @@ class ModelTrainer:
                 f"Gap: {train_accuracy - val_accuracy:.2%}"
             )
 
-        # Save model
+        # Log feature importance (before calibration, as calibrated models don't expose feature_importances_)
+        self._log_feature_importance(model, feature_names)
+
+        # Optional probability calibration
+        use_calibration = bool(self._get("training.use_probability_calibration", False))
+        if use_calibration and X_val is not None and y_val is not None:
+            logger.info("Calibrating probabilities using isotonic regression...")
+            model = self._calibrate_probabilities(model, X_val, y_val)
+            logger.info("✓ Probability calibration complete")
+
+        # Save model (calibrated if calibration was enabled)
         model_path = self._get("model.path", "xgb_eurusd_h1.pkl")
         joblib.dump(model, model_path)
         logger.info(f"Model saved to {model_path}")
-
-        # Log feature importance
-        self._log_feature_importance(model, feature_names)
 
         return TrainResult(
             model_path=model_path,
@@ -151,6 +159,46 @@ class ModelTrainer:
             val_accuracy=val_accuracy,
             feature_names=feature_names,
         )
+
+    def _calibrate_probabilities(
+        self,
+        model: xgb.XGBClassifier,
+        X_val: np.ndarray,
+        y_val: np.ndarray
+    ) -> CalibratedClassifierCV:
+        """
+        Calibrate probability predictions using isotonic regression.
+
+        Why calibrate:
+        - XGBoost probabilities are "confidence scores", not true probabilities
+        - Calibration makes them meaningful for decision-making
+        - Isotonic regression works best for tree-based models
+
+        Args:
+            model: Trained XGBoost model
+            X_val: Validation features
+            y_val: Validation labels
+
+        Returns:
+            Calibrated classifier wrapper
+        """
+        calibration_method = str(self._get("training.calibration_method", "isotonic"))
+
+        # CalibratedClassifierCV with cv='prefit' uses the already-trained model
+        calibrated_model = CalibratedClassifierCV(
+            model,
+            method=calibration_method,
+            cv='prefit',
+            n_jobs=-1
+        )
+
+        # Fit the calibrator on validation set
+        calibrated_model.fit(X_val, y_val)
+
+        logger.info(f"  Method: {calibration_method}")
+        logger.info(f"  Calibration samples: {len(X_val)}")
+
+        return calibrated_model
 
     def _compute_sample_weights(self, y: np.ndarray) -> Optional[np.ndarray]:
         """Compute class-balanced sample weights."""

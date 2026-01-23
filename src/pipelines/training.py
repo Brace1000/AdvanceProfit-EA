@@ -475,14 +475,25 @@ class TrainingPipeline:
             self.config.setdefault("model", {}).setdefault("params", {}).update(best_params)
             logger.info(f"HPO complete. Best validation F1: {best_val:.4f}")
 
-        # Train final model on train+validation (holdout never touched)
-        X_train_final = np.vstack([X_train, X_val])
-        y_train_final = np.concatenate([y_train, y_val])
+        # Train final model with calibration
+        # If calibration is enabled, keep validation set separate for calibration
+        # Otherwise, combine train+val for maximum training data
+        use_calibration = bool(self._get("training.use_probability_calibration", False))
 
-        logger.info("Training final model on train+validation data...")
-        result: TrainResult = self.trainer.train(
-            X_train_final, y_train_final, feature_cols, X_val=None, y_val=None
-        )
+        if use_calibration:
+            # Keep validation set separate for calibration
+            logger.info("Training final model with calibration (validation set used for calibration)...")
+            result: TrainResult = self.trainer.train(
+                X_train, y_train, feature_cols, X_val=X_val, y_val=y_val
+            )
+        else:
+            # Combine train+val for maximum training data (no calibration)
+            X_train_final = np.vstack([X_train, X_val])
+            y_train_final = np.concatenate([y_train, y_val])
+            logger.info("Training final model on train+validation data...")
+            result: TrainResult = self.trainer.train(
+                X_train_final, y_train_final, feature_cols, X_val=None, y_val=None
+            )
 
         # Evaluate on holdout (TRUE out-of-sample performance)
         logger.info("Evaluating on holdout set (true out-of-sample)...")
