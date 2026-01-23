@@ -322,7 +322,10 @@ class TrainingPipeline:
         self, model_path: str, df: pd.DataFrame, feature_cols: list[str], split_name: str
     ) -> Tuple[float, float, float]:
         """
-        Run simple backtest on a data split.
+        Run simple backtest on a data split with probability threshold filtering.
+
+        Only takes trades when model confidence exceeds threshold (default 0.55).
+        This prevents overtrading on low-conviction predictions.
 
         Returns:
             sharpe, win_rate, max_drawdown
@@ -333,7 +336,27 @@ class TrainingPipeline:
 
         try:
             model = joblib.load(model_path)
-            preds = model.predict(df[feature_cols].values)
+
+            # Get probability predictions
+            probs = model.predict_proba(df[feature_cols].values)
+
+            # Apply confidence threshold (only trade if >threshold)
+            confidence_threshold = float(self._get("backtesting.confidence_threshold", 0.55))
+            preds = np.full(len(df), 1)  # Default to Range (1 = no trade)
+
+            for i in range(len(df)):
+                max_prob = probs[i].max()
+                if max_prob >= confidence_threshold:
+                    preds[i] = int(probs[i].argmax())
+
+            # Log filtering stats
+            total_signals = len(df)
+            filtered_signals = int((preds != 1).sum())  # Not Range
+            logger.info(
+                f"  Confidence filter: {filtered_signals}/{total_signals} trades "
+                f"({filtered_signals/total_signals:.1%}) passed threshold={confidence_threshold}"
+            )
+
         except Exception as e:
             logger.error(f"Failed to load model for backtest: {e}")
             return 0.0, 0.0, 0.0

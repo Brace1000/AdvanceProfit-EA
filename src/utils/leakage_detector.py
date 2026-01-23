@@ -118,7 +118,8 @@ class LeakageDetector:
         Identify calendar/temporal context features that shouldn't be tested for leakage.
 
         Calendar features are static identifiers (hour=14 is always 14), not time-series
-        data that can leak future information.
+        data that can leak future information. These provide market structure context
+        (e.g., London session has more volatility than Asian session).
 
         Args:
             feature: Feature name

@@ -171,7 +171,14 @@ class FeatureEngineer:
         return df
 
     def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add time-based features with One-Hot Encoding for categorical variables."""
+        """
+        Add time-based features with One-Hot Encoding for categorical variables.
+
+        Calendar features provide market structure context:
+        - Sessions capture real volatility patterns (London > Asian)
+        - Days capture week patterns (Friday closings, Monday gaps)
+        Combined with P1 regime features for best results.
+        """
         if isinstance(df.index, pd.DatetimeIndex):
             df["hour"] = df.index.hour
 
@@ -338,6 +345,11 @@ class FeatureEngineer:
     def default_feature_columns() -> list[str]:
         """
         Return list of feature column names with OHE and P1 regime features.
+
+        Best tested configuration combines:
+        - Calendar features (sessions, days) for market structure context
+        - P1 regime features (squeeze, choppiness, z-score) for price action
+        - Technical indicators (EMAs, RSI, ATR) for momentum/volatility
 
         Includes:
         - H1/H4 technical indicators

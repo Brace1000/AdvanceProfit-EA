@@ -83,8 +83,8 @@ training:
   # Label thresholds for classification
   # Triple Barrier Method (recommended for profitable trading)
   use_triple_barrier: true      # Use TP/SL/Time barriers (overrides adaptive/fixed)
-  tp_pips: 15.0                 # Profit target in pips
-  sl_pips: 10.0                 # Stop loss in pips (gives 1.5:1 R/R)
+  tp_pips: 25.0                 # Profit target in pips (best tested configuration)
+  sl_pips: 15.0                 # Stop loss in pips (gives 1.67:1 R/R)
   max_horizon_bars: 24          # Max bars to hold position (24h for H1 data)
 
   # Volatility-adjusted thresholds (legacy, disabled when triple_barrier=true)
@@ -182,6 +182,7 @@ backtesting:
   start_date: "2023-01-01"
   end_date: "2024-12-31"
   timeframe: "H1"
+  confidence_threshold: 0.55  # Best tested threshold (Sharpe -0.46)
 
 # Experiment Tracking (MLflow)
 mlflow:
