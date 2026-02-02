@@ -105,7 +105,7 @@ training:
   abort_on_leakage: false       # Set to true to abort training if leakage detected
 
   # Probability calibration
-  use_probability_calibration: true   # Calibrate probabilities for better decision-making
+  use_probability_calibration: false  # Disabled - isotonic creates degenerate mappings
   calibration_method: "isotonic"      # 'isotonic' or 'sigmoid' (isotonic better for trees)
 
   # Early stopping (only used when validation set provided)

@@ -21,7 +21,7 @@ from tabulate import tabulate
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from src.config import load_config
+from src.config import get_config
 from src.logger import get_logger
 
 logger = get_logger("probability_analysis")
@@ -135,18 +135,18 @@ def main():
     logger.info("=" * 60)
 
     # Load config
-    config = load_config()
+    config = get_config()
 
     # Get barrier settings
-    tp_pips = float(config.get("training", {}).get("tp_pips", 25.0))
-    sl_pips = float(config.get("training", {}).get("sl_pips", 15.0))
-    confidence_threshold = float(config.get("backtesting", {}).get("confidence_threshold", 0.55))
+    tp_pips = float(config.get("training.tp_pips", 25.0))
+    sl_pips = float(config.get("training.sl_pips", 15.0))
+    confidence_threshold = float(config.get("backtesting.confidence_threshold", 0.55))
 
     logger.info(f"Barriers: TP={tp_pips} pips, SL={sl_pips} pips")
     logger.info(f"Confidence threshold: {confidence_threshold}")
 
     # Load processed data
-    data_file = Path(config.get("paths", {}).get("data_processed_file", "EURUSD_H1_clean.csv"))
+    data_file = Path(config.get("paths.data_processed_file", "EURUSD_H1_clean.csv"))
     logger.info(f"Loading data from {data_file}")
 
     if not data_file.exists():
@@ -156,7 +156,7 @@ def main():
     df = pd.read_csv(data_file)
 
     # Load model
-    model_path = Path(config.get("model", {}).get("path", "xgb_eurusd_h1.pkl"))
+    model_path = Path(config.get("model.path", "xgb_eurusd_h1.pkl"))
     logger.info(f"Loading model from {model_path}")
 
     if not model_path.exists():
@@ -165,12 +165,30 @@ def main():
 
     model = joblib.load(model_path)
 
-    # Get feature columns (exclude label and metadata)
-    feature_cols = [c for c in df.columns if c not in ['label', 'time', 'datetime', 'timestamp']]
+    # Load feature list saved during training (authoritative source)
+    features_path = Path("features_used.json")
+    if features_path.exists():
+        import json
+        with open(features_path) as f:
+            feature_cols = json.load(f)
+        logger.info(f"Loaded {len(feature_cols)} features from {features_path}")
+    else:
+        feature_cols = config.get("model.features", [])
+        logger.warning("features_used.json not found, falling back to config.yaml")
+
+    if not feature_cols:
+        logger.error("No features found - run training first")
+        return
+
+    # Verify features exist in data
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        logger.error(f"Features missing from data file: {missing}")
+        return
 
     # Split data (use same split as training)
-    train_ratio = float(config.get("training", {}).get("train_ratio", 0.6))
-    val_ratio = float(config.get("training", {}).get("val_ratio", 0.2))
+    train_ratio = float(config.get("training.train_ratio", 0.6))
+    val_ratio = float(config.get("training.val_ratio", 0.2))
 
     n = len(df)
     train_end = int(n * train_ratio)
@@ -182,14 +200,53 @@ def main():
 
     # Get features and labels
     X_holdout = df_holdout[feature_cols].values
-    y_holdout = df_holdout['label'].values
+
+    # Apply same label mapping as training: {-1: 0, 0: 1, 1: 2}
+    y_holdout = pd.Series(df_holdout['label']).map({-1: 0, 0: 1, 1: 2}).values
+
+    logger.info(f"Feature count: {len(feature_cols)}")
+    logger.info(f"Holdout shape: {X_holdout.shape}")
 
     # Get probability predictions
-    y_pred_proba = model.predict_proba(X_holdout)
-    y_pred = model.predict(X_holdout)
+    try:
+        y_pred_proba = model.predict_proba(X_holdout)
+        y_pred = model.predict(X_holdout)
+    except Exception as e:
+        logger.error(f"Error during prediction: {e}")
+        logger.error(f"Model type: {type(model)}")
+        logger.error(f"Model has predict_proba: {hasattr(model, 'predict_proba')}")
+
+        # If it's a calibrated model, check the base estimator
+        if hasattr(model, 'calibrated_classifiers_'):
+            logger.error(f"Calibrated classifiers: {len(model.calibrated_classifiers_)}")
+            logger.error(f"Classes: {model.classes_}")
+
+        raise
 
     # Calculate PnL for each sample
     trades_pnl = calculate_pnl_from_labels(y_holdout, y_pred, tp_pips, sl_pips)
+
+    # First, show overall probability distribution (all predictions)
+    max_probs = y_pred_proba.max(axis=1)
+    pred_classes = y_pred_proba.argmax(axis=1)
+
+    print("\n" + "=" * 80)
+    print("OVERALL PROBABILITY DISTRIBUTION (ALL PREDICTIONS)")
+    print("=" * 80)
+    print(f"Total samples: {len(max_probs)}")
+    print(f"Max probability stats:")
+    print(f"  Min:    {max_probs.min():.3f}")
+    print(f"  25th:   {np.percentile(max_probs, 25):.3f}")
+    print(f"  Median: {np.percentile(max_probs, 50):.3f}")
+    print(f"  75th:   {np.percentile(max_probs, 75):.3f}")
+    print(f"  90th:   {np.percentile(max_probs, 90):.3f}")
+    print(f"  95th:   {np.percentile(max_probs, 95):.3f}")
+    print(f"  Max:    {max_probs.max():.3f}")
+    print(f"\nPredictions by class:")
+    print(f"  Sell (0):  {(pred_classes == 0).sum()} ({(pred_classes == 0).sum()/len(pred_classes):.1%})")
+    print(f"  Range (1): {(pred_classes == 1).sum()} ({(pred_classes == 1).sum()/len(pred_classes):.1%})")
+    print(f"  Buy (2):   {(pred_classes == 2).sum()} ({(pred_classes == 2).sum()/len(pred_classes):.1%})")
+    print(f"\nAbove threshold {confidence_threshold}: {(max_probs >= confidence_threshold).sum()} ({(max_probs >= confidence_threshold).sum()/len(max_probs):.1%})")
 
     # Analyze bins
     logger.info("\n" + "=" * 60)
@@ -221,6 +278,19 @@ def main():
 
     headers = ['Probability Bin', 'Trades', 'Win Rate', 'Mean Pips/Trade', 'Total Pips', 'Avg Prob']
     print(tabulate(table_data, headers=headers, tablefmt='grid'))
+
+    # Check if any trades passed threshold
+    if len(bin_df) == 0:
+        print("\n" + "=" * 80)
+        print("⚠ NO TRADES PASSED THRESHOLD")
+        print("=" * 80)
+        print(f"The model is extremely conservative - no predictions reached {confidence_threshold} confidence.")
+        print("\nRECOMMENDATIONS:")
+        print(f"1. Lower the confidence threshold to 0.45 or 0.50")
+        print(f"2. Check uncalibrated probability distribution")
+        print(f"3. Consider if calibration is too aggressive for this dataset")
+        print("\n" + "=" * 80)
+        return
 
     # Calculate overall statistics
     total_trades = bin_df['count'].sum()

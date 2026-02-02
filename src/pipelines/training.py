@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Set
 
+import json
 import numpy as np
 import pandas as pd
 import joblib
@@ -427,6 +428,12 @@ class TrainingPipeline:
         correlation_threshold = float(self._get("training.correlation_threshold", 0.85))
         feature_cols = self._prune_correlated_features(df, feature_cols, correlation_threshold)
 
+        # Save feature list so analysis scripts use the correct features
+        features_path = "features_used.json"
+        with open(features_path, "w") as f:
+            json.dump(feature_cols, f, indent=2)
+        logger.info(f"Saved {len(feature_cols)} feature names to {features_path}")
+
         # Leakage detection (run before splitting to detect issues early)
         if bool(self._get("training.detect_leakage", True)):
             logger.info("Running leakage detection...")
@@ -434,14 +441,17 @@ class TrainingPipeline:
             warnings = detector.run_tests(feature_cols)
 
             if warnings:
-                logger.warning("🚨 POTENTIAL LEAKAGE DETECTED:")
+                logger.warning(f"POTENTIAL LEAKAGE DETECTED ({len(warnings)} issues):")
                 for w in warnings:
-                    logger.warning(f"  ⚠️  {w}")
-                # Optionally abort training if leakage detected
-                # if self._get("training.abort_on_leakage", False):
-                #     raise ValueError("Leakage detected. Training aborted.")
+                    logger.warning(f"  {w}")
+
+                if bool(self._get("training.abort_on_leakage", False)):
+                    raise ValueError(
+                        f"Leakage detected in {len(warnings)} features. "
+                        "Fix features or set abort_on_leakage: false to continue."
+                    )
             else:
-                logger.info("✅ All features passed leakage tests")
+                logger.info("All features passed leakage tests")
 
             # Generate correlation decay visualization
             try:
