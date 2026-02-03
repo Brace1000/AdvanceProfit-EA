@@ -27,51 +27,36 @@ data_sources:
 # Model Configuration
 model:
   path: "xgb_eurusd_h1.pkl"
-  feature_count: 33  # H1(11) + Time(9) + H4(11) + Returns(2) with P1 regime features
+  feature_count: 15  # H1(8) + H4(7) - normalized, no calendar features
   features:
-    # H1 features (8)
-    - close_ema50_h1
-    - ema50_ema200_h1
-    - rsi_h1
-    - rsi_slope_h1
-    - atr_ratio_h1
-    - adx_h1
-    - body_h1
-    - range_h1
-    # Time features (9): hour + 3 sessions + 5 days
-    - hour
-    - session_asian
-    - session_european
-    - session_american
-    - dow_monday
-    - dow_tuesday
-    - dow_wednesday
-    - dow_thursday
-    - dow_friday
-    # H1 return (1)
-    - prev_return_h1
-    # H4 features (8)
-    - close_ema50_h4
-    - ema50_ema200_h4
-    - rsi_h4
-    - rsi_slope_h4
-    - atr_ratio_h4
-    - adx_h4
-    - body_h4
-    - range_h4
-    # H4 return (1)
-    - prev_return_h4
+    # H1 features (8): trend + momentum + volatility + regime
+    - close_ema50_h1       # (close - ema50) / ema50
+    - ema50_ema200_h1      # (ema50 - ema200) / close
+    - rsi_h1               # RSI [0, 100]
+    - atr_ratio_h1         # atr / close
+    - adx_h1               # trend strength
+    - squeeze_ratio_h1     # BB/KC ratio
+    - choppiness_h1        # trend vs range [0, 100]
+    - body_ratio_h1        # body / range [-1, 1]
+    # H4 features (7): higher timeframe context
+    - ema50_ema200_h4      # H4 trend direction
+    - atr_ratio_h4         # H4 volatility
+    - adx_h4               # H4 trend strength
+    - squeeze_ratio_h4     # H4 regime
+    - choppiness_h4        # H4 trend vs range
+    - body_ratio_h4        # H4 candle character
+    - range_pct_h4         # H4 per-bar volatility
   params:
-    # Default params - will be overridden by HPO
+    # Fixed conservative params from barrier sweep (proven edge)
     max_depth: 3
-    learning_rate: 0.05
-    n_estimators: 150
-    subsample: 0.8
-    colsample_bytree: 0.8
-    min_child_weight: 5
-    reg_alpha: 30.0    # Increased to combat overfitting
-    reg_lambda: 30.0   # Increased to combat overfitting
-    gamma: 0.2
+    learning_rate: 0.03
+    n_estimators: 80
+    subsample: 0.7
+    colsample_bytree: 0.6
+    min_child_weight: 40
+    reg_alpha: 50.0
+    reg_lambda: 50.0
+    gamma: 0.8
 
 # Training Configuration
 training:
@@ -83,8 +68,8 @@ training:
   # Label thresholds for classification
   # Triple Barrier Method (recommended for profitable trading)
   use_triple_barrier: true      # Use TP/SL/Time barriers (overrides adaptive/fixed)
-  tp_pips: 25.0                 # Profit target in pips (best tested configuration)
-  sl_pips: 15.0                 # Stop loss in pips (gives 1.67:1 R/R)
+  tp_pips: 20.0                 # Profit target in pips (barrier sweep winner)
+  sl_pips: 15.0                 # Stop loss in pips (gives 1.33:1 R/R)
   max_horizon_bars: 24          # Max bars to hold position (24h for H1 data)
 
   # Volatility-adjusted thresholds (legacy, disabled when triple_barrier=true)
@@ -102,7 +87,7 @@ training:
 
   # Leakage detection
   detect_leakage: true          # Run leakage detection tests
-  abort_on_leakage: false       # Set to true to abort training if leakage detected
+  abort_on_leakage: false       # Keep false for now - will enable after validating clean features
 
   # Probability calibration
   use_probability_calibration: false  # Disabled - isotonic creates degenerate mappings
@@ -116,8 +101,8 @@ training:
 
 # Hyperparameter Optimization (Optuna)
 hpo:
-  enabled: true
-  trials: 50            # Number of HPO trials (reduced for faster iteration)
+  enabled: false         # Disabled — using fixed conservative params from barrier sweep
+  trials: 50            # Number of HPO trials (unused while disabled)
   study_name: "xgb_hpo"
   storage: null         # Set to "sqlite:///hpo.db" to persist studies
   load_if_exists: false
@@ -186,7 +171,7 @@ backtesting:
   start_date: "2023-01-01"
   end_date: "2024-12-31"
   timeframe: "H1"
-  confidence_threshold: 0.55  # Best tested threshold (Sharpe -0.46)
+  confidence_threshold: 0.34  # Sell-only: min confidence for Sell predictions
 
 # Experiment Tracking (MLflow)
 mlflow:

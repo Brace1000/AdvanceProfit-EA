@@ -32,32 +32,30 @@ def _get_nested(config: Dict[str, Any], key_path: str, default: Any = None) -> A
 
 def suggest_params(trial: optuna.trial.Trial) -> Dict[str, Any]:
     """
-    Suggest hyperparameters for XGBoost.
+    Suggest hyperparameters for XGBoost (3-class: Sell/Range/Buy).
 
-    Search space is constrained to prevent overfitting:
-    - max_depth: 2-5 (shallow trees generalize better)
-    - n_estimators: 50-300 (moderate ensemble size)
-    - Strong regularization parameters
+    Wide search ranges allow HPO to find the right balance between
+    regularization and expressiveness.
     """
     return {
-        # Tree structure - kept shallow to prevent overfitting
-        "n_estimators": trial.suggest_int("n_estimators", 50, 300, step=25),
-        "max_depth": trial.suggest_int("max_depth", 2, 5),
-        "min_child_weight": trial.suggest_int("min_child_weight", 3, 10),
+        # Tree structure
+        "n_estimators": trial.suggest_int("n_estimators", 30, 200, step=10),
+        "max_depth": trial.suggest_int("max_depth", 2, 4),
+        "min_child_weight": trial.suggest_int("min_child_weight", 5, 80),
 
-        # Learning rate - lower values with more trees
+        # Learning rate
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
 
-        # Subsampling - helps prevent overfitting
-        "subsample": trial.suggest_float("subsample", 0.6, 0.9),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
+        # Subsampling
+        "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.9),
 
-        # Regularization - VERY strong regularization to prevent overfitting
-        "gamma": trial.suggest_float("gamma", 0.1, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 10.0, 100.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 10.0, 100.0, log=True),
+        # Regularization — wide range so HPO can find the sweet spot
+        "gamma": trial.suggest_float("gamma", 0.0, 3.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 100.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 100.0, log=True),
 
-        # Fixed parameters
+        # Fixed parameters — 3-class: Sell(0) / Range(1) / Buy(2)
         "objective": "multi:softprob",
         "num_class": 3,
         "eval_metric": "mlogloss",
@@ -67,11 +65,12 @@ def suggest_params(trial: optuna.trial.Trial) -> Dict[str, Any]:
 
 
 def _compute_sample_weights(y: np.ndarray) -> Optional[np.ndarray]:
-    """Compute class-balanced sample weights."""
+    """Compute class-balanced sample weights (3-class)."""
     try:
-        classes = np.array([0, 1, 2], dtype=int)
+        classes = np.array([0, 1, 2])
         class_weights = compute_class_weight(class_weight="balanced", classes=classes, y=y)
-        return class_weights[y]
+        weight_map = dict(zip(classes, class_weights))
+        return np.array([weight_map[label] for label in y])
     except Exception:
         return None
 

@@ -22,6 +22,9 @@ from src.pipelines.training import TrainingPipeline
 
 logger = get_logger(__name__)
 
+LOG_FILE = Path(__file__).parent / "logs" / "run_all.log"
+LOG_FILE.parent.mkdir(exist_ok=True)
+
 
 def main(config_path: Optional[Path] = None) -> None:
     try:
@@ -36,42 +39,47 @@ def main(config_path: Optional[Path] = None) -> None:
         logger.info("=" * 60)
         logger.info("Training Complete!")
         logger.info("=" * 60)
-        logger.info(f"Model saved: {results['model_path']}")
-        logger.info(f"Processed dataset: {results['processed_path']}")
-        logger.info(f"Features used: {results['features_used']}")
-        logger.info("-" * 60)
-        logger.info("CLASS DISTRIBUTION:")
-        dist = results['class_distribution']
-        logger.info(f"  Sell:  {dist['sell']:.1%}")
-        logger.info(f"  Range: {dist['range']:.1%}")
-        logger.info(f"  Buy:   {dist['buy']:.1%}")
-        logger.info("-" * 60)
-        logger.info("ACCURACY METRICS:")
-        logger.info(f"  Train accuracy:    {results['train_accuracy']:.2%}")
-        logger.info(f"  Holdout accuracy:  {results['holdout_accuracy']:.2%}")
-        logger.info("-" * 60)
-        logger.info("BACKTEST METRICS (on holdout set):")
-        logger.info(f"  Win rate:          {results['win_rate']:.2%}")
-        logger.info(f"  Sharpe ratio:      {results['sharpe']:.2f}")
-        logger.info(f"  Max drawdown:      {results['max_drawdown']:.2%}")
-        logger.info("=" * 60)
 
-        # Overfitting warning
+        dist = results['class_distribution']
         gap = results['train_accuracy'] - results['holdout_accuracy']
-        if gap > 0.15:
-            logger.warning(
-                f"Potential overfitting! Train-Holdout gap: {gap:.2%}. "
-                "Consider more regularization or more data."
-            )
 
-        # Class imbalance warning
-        dist = results['class_distribution']
-        if max(dist.values()) > 0.80:
-            dominant = max(dist, key=dist.get)
-            logger.warning(
-                f"Severe class imbalance! {dominant.capitalize()} is {dist[dominant]:.1%}. "
-                "Consider adjusting thresholds in config.yaml."
-            )
+        # Build summary lines
+        lines = [
+            "=" * 60,
+            "TRAINING SUMMARY",
+            "=" * 60,
+            f"Model: {results['model_path']}",
+            f"Features ({len(results['features_used'])}): {results['features_used']}",
+            "-" * 60,
+            "CLASS DISTRIBUTION (3-class, Sell-only trading):",
+            f"  Sell:   {dist['sell']:.1%}",
+            f"  Range:  {dist['range']:.1%}",
+            f"  Buy:    {dist['buy']:.1%}",
+            "-" * 60,
+            "ACCURACY:",
+            f"  Train:    {results['train_accuracy']:.2%}",
+            f"  Holdout:  {results['holdout_accuracy']:.2%}",
+            f"  Gap:      {gap:.2%}",
+            "-" * 60,
+            "BACKTEST (holdout, Sell-only, TP/SL simulation):",
+            f"  Win rate:           {results['win_rate']:.2%}",
+            f"  Total pips:         {results['total_pips']:+.0f}",
+            f"  Sharpe (per-bar):   {results['sharpe_bar']:.2f}",
+            f"  Sharpe (per-trade): {results['sharpe_trade']:.2f}",
+            f"  Max DD:             {results['max_drawdown']:.2%}",
+            "=" * 60,
+        ]
+
+        if gap > 0.15:
+            lines.append(f"WARNING: Potential overfitting (gap={gap:.2%})")
+
+        # Log to console
+        for line in lines:
+            logger.info(line)
+
+        # Write clean summary to log file
+        LOG_FILE.write_text("\n".join(lines), encoding="utf-8")
+        logger.info(f"Summary saved to {LOG_FILE}")
 
     except FileNotFoundError as e:
         logger.error(f"File not found: {e}")

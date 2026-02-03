@@ -73,7 +73,7 @@ class ModelTrainer:
         Returns:
             TrainResult with model path and metrics
         """
-        # Build parameters from config
+        # Build parameters from config — 3-class: Sell(0) / Range(1) / Buy(2)
         params = {
             "objective": "multi:softprob",
             "num_class": 3,
@@ -201,14 +201,15 @@ class ModelTrainer:
         return calibrated_model
 
     def _compute_sample_weights(self, y: np.ndarray) -> Optional[np.ndarray]:
-        """Compute class-balanced sample weights."""
+        """Compute class-balanced sample weights (3-class: 0=Sell, 1=Range, 2=Buy)."""
         try:
-            classes = np.array([0, 1, 2], dtype=int)
+            classes = np.array([0, 1, 2])
             class_weights = compute_class_weight(
                 class_weight="balanced", classes=classes, y=y
             )
-            weights = class_weights[y]
-            logger.debug(f"Class weights: {dict(zip(classes, class_weights))}")
+            weight_map = dict(zip(classes, class_weights))
+            weights = np.array([weight_map[label] for label in y])
+            logger.debug(f"Class weights: {weight_map}")
             return weights
         except Exception as e:
             logger.warning(f"Could not compute sample weights: {e}")

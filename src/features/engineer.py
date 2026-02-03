@@ -18,12 +18,9 @@ class FeatureEngineer:
     Supports multi-timeframe features (H1 + H4) to match what the EA sends.
     Features are calculated on both H1 data and resampled H4 data.
 
-    20 Features total:
-    - H1: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, adx, body, range
-    - hour, session (time-based)
-    - prev_return_h1
-    - H4: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, adx, body, range
-    - prev_return_h4
+    15 Features total (before correlation pruning):
+    - H1 regime (8): close_ema50, ema50_ema200, rsi, atr_ratio, adx, squeeze, choppiness, body_ratio
+    - H4 regime (7): ema50_ema200, atr_ratio, adx, squeeze, choppiness, body_ratio, range_pct
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -82,28 +79,21 @@ class FeatureEngineer:
         # Calculate H4 features by resampling
         df = self._add_h4_features(df)
 
-        # Add time-based features
+        # Time features still calculated (available if needed) but not in default feature list
         df = self._add_time_features(df)
 
-        # ANTI-LEAKAGE: Shift all non-calendar features by 1
-        # This ensures feature[t] can only predict label[t+1], not label[t]
-        calendar_features = ["hour", "session_asian", "session_european", "session_american",
-                           "dow_monday", "dow_tuesday", "dow_wednesday", "dow_thursday", "dow_friday"]
-
+        # ANTI-LEAKAGE: Shift all features by 1
+        # This ensures feature[t] uses data from bar t-1, predicting label at bar t
         feature_cols = self.default_feature_columns()
-        ts_features = [f for f in feature_cols if f not in calendar_features and f in df.columns]
+        shift_features = [f for f in feature_cols if f in df.columns]
 
-        if ts_features:
-            logger.debug(f"Applying shift(1) to {len(ts_features)} time-series features")
-            df[ts_features] = df[ts_features].shift(1)
+        if shift_features:
+            logger.debug(f"Applying shift(1) to {len(shift_features)} features")
+            df[shift_features] = df[shift_features].shift(1)
 
-        # ADDITIONAL LAG for inherently lagging indicators
-        # These features use smoothed/averaged values, so they're backward-looking
-        # Extra shift helps model learn them as they appear in real-time (with delay)
+        # ADDITIONAL LAG for inherently lagging indicators (smoothed values)
         lagging_indicators = [
             "ema50_ema200_h1", "ema50_ema200_h4",  # EMA crossovers
-            "rsi_slope_h1", "rsi_slope_h4",         # RSI slopes
-            "z_close_h1", "z_close_h4"              # Z-scores (100-bar lookback)
         ]
         lagging_present = [f for f in lagging_indicators if f in df.columns]
 
@@ -214,10 +204,16 @@ class FeatureEngineer:
         return df
 
     def _ema(self, df: pd.DataFrame, suffix: str = "") -> pd.DataFrame:
-        """Calculate EMA-based features."""
-        df[f"close_ema50{suffix}"] = df["close"].ewm(span=50, adjust=False).mean()
-        df[f"close_ema200{suffix}"] = df["close"].ewm(span=200, adjust=False).mean()
-        df[f"ema50_ema200{suffix}"] = df[f"close_ema50{suffix}"] - df[f"close_ema200{suffix}"]
+        """Calculate EMA-based features as normalized ratios (not raw prices)."""
+        ema50 = df["close"].ewm(span=50, adjust=False).mean()
+        ema200 = df["close"].ewm(span=200, adjust=False).mean()
+
+        # Normalized: percentage distance from EMA50 (scale-independent)
+        df[f"close_ema50{suffix}"] = (df["close"] - ema50) / (ema50 + 1e-10)
+
+        # Normalized: EMA spread as percentage of price (scale-independent)
+        df[f"ema50_ema200{suffix}"] = (ema50 - ema200) / (df["close"] + 1e-10)
+
         return df
 
     def _rsi(self, df: pd.DataFrame, suffix: str = "", period: int = 14) -> pd.DataFrame:
@@ -253,9 +249,16 @@ class FeatureEngineer:
         return df
 
     def _candle(self, df: pd.DataFrame, suffix: str = "") -> pd.DataFrame:
-        """Calculate candlestick features."""
-        df[f"body{suffix}"] = df["close"] - df["open"]
-        df[f"range{suffix}"] = df["high"] - df["low"]
+        """Calculate candlestick features (normalized)."""
+        body = df["close"] - df["open"]
+        candle_range = df["high"] - df["low"]
+
+        # Body ratio: how much of the candle is body vs wicks [-1, 1]
+        df[f"body_ratio{suffix}"] = body / (candle_range + 1e-10)
+
+        # Range normalized by close (like atr_ratio but per-bar)
+        df[f"range_pct{suffix}"] = candle_range / (df["close"] + 1e-10)
+
         return df
 
     def _returns(self, df: pd.DataFrame, suffix: str = "") -> pd.DataFrame:
@@ -344,55 +347,32 @@ class FeatureEngineer:
     @staticmethod
     def default_feature_columns() -> list[str]:
         """
-        Return list of feature column names with OHE and P1 regime features.
+        Return list of feature columns validated by decision tree analysis.
 
-        Best tested configuration combines:
-        - Calendar features (sessions, days) for market structure context
-        - P1 regime features (squeeze, choppiness, z-score) for price action
-        - Technical indicators (EMAs, RSI, ATR) for momentum/volatility
-
-        Includes:
-        - H1/H4 technical indicators
-        - Time context (OHE for sessions and days)
-        - P1 regime features (squeeze, choppiness, z-score)
+        Selection criteria:
+        - Non-zero importance in decision tree baseline (depth 2-5)
+        - All values normalized (no raw prices that overfit to specific levels)
+        - Calendar features REMOVED (zero tree importance, caused XGBoost overfitting)
+        - z_close REMOVED (redundant with normalized EMA features)
+        - rsi_slope REMOVED (zero tree importance)
+        - Raw body/range REPLACED with normalized body_ratio and range_pct
         """
         return [
-            # H1 features (11): technical + regime
-            "close_ema50_h1",
-            "ema50_ema200_h1",
-            "rsi_h1",
-            "rsi_slope_h1",
-            "atr_ratio_h1",
-            "adx_h1",
-            "body_h1",
-            "range_h1",
-            "squeeze_ratio_h1",     # P1: Volatility compression
-            "choppiness_h1",        # P1: Trend vs range
-            "z_close_h1",           # P1: Price level normalization
-            # Time features (9): hour + 3 sessions + 5 days
-            "hour",
-            "session_asian",
-            "session_european",
-            "session_american",
-            "dow_monday",
-            "dow_tuesday",
-            "dow_wednesday",
-            "dow_thursday",
-            "dow_friday",
-            # H1 return (1)
-            "prev_return_h1",
-            # H4 features (11): technical + regime
-            "close_ema50_h4",
-            "ema50_ema200_h4",
-            "rsi_h4",
-            "rsi_slope_h4",
-            "atr_ratio_h4",
-            "adx_h4",
-            "body_h4",
-            "range_h4",
-            "squeeze_ratio_h4",     # P1: Volatility compression
-            "choppiness_h4",        # P1: Trend vs range
-            "z_close_h4",           # P1: Price level normalization
-            # H4 return (1)
-            "prev_return_h4",
+            # H1 features (8): trend + momentum + volatility + regime
+            "close_ema50_h1",       # Normalized: (close - ema50) / ema50
+            "ema50_ema200_h1",      # Normalized: (ema50 - ema200) / close
+            "rsi_h1",              # Bounded [0, 100]
+            "atr_ratio_h1",        # Normalized: atr / close
+            "adx_h1",             # Trend strength
+            "squeeze_ratio_h1",    # Regime: BB width / KC width
+            "choppiness_h1",       # Regime: trending vs ranging [0, 100]
+            "body_ratio_h1",       # Candle character: body / range [-1, 1]
+            # H4 features (7): higher timeframe context
+            "ema50_ema200_h4",     # Normalized: H4 trend direction
+            "atr_ratio_h4",        # H4 volatility (tree #2 importance)
+            "adx_h4",             # H4 trend strength (tree #1 importance)
+            "squeeze_ratio_h4",    # H4 regime (tree #3 importance)
+            "choppiness_h4",       # H4 trend vs range
+            "body_ratio_h4",       # H4 candle character
+            "range_pct_h4",        # H4 volatility per bar
         ]

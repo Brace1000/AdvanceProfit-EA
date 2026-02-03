@@ -224,7 +224,7 @@ class TrainingPipeline:
         return df
 
     def _get_class_distribution(self, y: np.ndarray) -> Dict[str, float]:
-        """Calculate class distribution percentages."""
+        """Calculate class distribution percentages (3-class: Sell/Range/Buy)."""
         total = len(y)
         if total == 0:
             return {"sell": 0.0, "range": 0.0, "buy": 0.0}
@@ -321,79 +321,151 @@ class TrainingPipeline:
 
     def _backtest_on_split(
         self, model_path: str, df: pd.DataFrame, feature_cols: list[str], split_name: str
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, float, float]:
         """
-        Run simple backtest on a data split with probability threshold filtering.
+        Run triple-barrier backtest on a data split with Sell-only filtering.
 
-        Only takes trades when model confidence exceeds threshold (default 0.55).
-        This prevents overtrading on low-conviction predictions.
+        Simulates actual TP/SL execution: on each Sell signal, holds the short
+        position until TP, SL, or time horizon is hit — matching how the model
+        was trained.
 
         Returns:
-            sharpe, win_rate, max_drawdown
+            sharpe_per_bar, sharpe_per_trade, win_rate, max_drawdown, total_pips
         """
         if len(df) < 2:
             logger.warning(f"Insufficient data for {split_name} backtest")
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
         try:
             model = joblib.load(model_path)
 
-            # Get probability predictions
             probs = model.predict_proba(df[feature_cols].values)
+            preds = np.argmax(probs, axis=1)
+            max_probs = np.max(probs, axis=1)
 
-            # Apply confidence threshold (only trade if >threshold)
-            confidence_threshold = float(self._get("backtesting.confidence_threshold", 0.55))
-            preds = np.full(len(df), 1)  # Default to Range (1 = no trade)
+            confidence_threshold = float(self._get("backtesting.confidence_threshold", 0.40))
+            sell_mask = (preds == 0) & (max_probs >= confidence_threshold)
 
-            for i in range(len(df)):
-                max_prob = probs[i].max()
-                if max_prob >= confidence_threshold:
-                    preds[i] = int(probs[i].argmax())
-
-            # Log filtering stats
             total_signals = len(df)
-            filtered_signals = int((preds != 1).sum())  # Not Range
+            sell_signals = int(sell_mask.sum())
             logger.info(
-                f"  Confidence filter: {filtered_signals}/{total_signals} trades "
-                f"({filtered_signals/total_signals:.1%}) passed threshold={confidence_threshold}"
+                f"  Sell-only filter: {sell_signals}/{total_signals} signals "
+                f"({sell_signals/total_signals:.1%}) above threshold={confidence_threshold}"
             )
 
         except Exception as e:
             logger.error(f"Failed to load model for backtest: {e}")
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
-        df = df.copy()
-        # Fix: Ensure predictions are aligned with df index
-        df["position"] = pd.Series(preds, index=df.index).map({0: -1, 1: 0, 2: 1})
-        df["next_ret"] = df["close"].pct_change(-1) * -1
+        # Triple-barrier execution parameters
+        tp_pips = float(self._get("training.tp_pips", 20.0))
+        sl_pips = float(self._get("training.sl_pips", 15.0))
+        max_horizon = int(self._get("training.max_horizon_bars", 24))
+        pip_value = 0.0001
         trading_cost = float(self._get("backtesting.commission", 0.0001))
 
-        df = df.iloc[:-1].copy()
-        if len(df) == 0:
-            return 0.0, 0.0, 0.0
+        closes = df["close"].values
+        highs = df["high"].values
+        lows = df["low"].values
+        sell_indices = np.where(sell_mask)[0]
 
-        df["pnl"] = df["position"] * df["next_ret"] - (df["position"] != 0).astype(float) * trading_cost
+        # Simulate trades: for each Sell signal, scan forward for barrier hit
+        trade_results = []  # PnL in price units per trade
+        in_trade_until = -1  # prevents overlapping trades
 
-        avg_pnl = float(df["pnl"].mean())
-        std_pnl = float(df["pnl"].std(ddof=1)) if len(df) > 1 else 0.0
-        sharpe = (avg_pnl / std_pnl) * np.sqrt(252) if std_pnl > 0 else 0.0
+        for idx in sell_indices:
+            if idx <= in_trade_until:
+                continue  # skip if already in a trade
 
-        cum_curve = (1 + df["pnl"]).cumprod()
-        rolling_max = cum_curve.cummax()
-        drawdown = cum_curve / rolling_max - 1
-        max_dd = float(drawdown.min()) if len(drawdown) else 0.0
+            entry = closes[idx]
+            tp_price = tp_pips * pip_value
+            sl_price = sl_pips * pip_value
+            horizon_end = min(idx + 1 + max_horizon, len(df))
 
-        wins = int((df["pnl"] > 0).sum())
-        losses = int((df["pnl"] < 0).sum())
+            if idx + 1 >= len(df):
+                continue
+
+            # Scan forward bar by bar (Sell = short, so profit when price drops)
+            outcome = None
+            exit_bar = idx
+            for j in range(idx + 1, horizon_end):
+                bar_low = lows[j]
+                bar_high = highs[j]
+
+                # TP hit: price dropped enough (short profits)
+                if (entry - bar_low) >= tp_price:
+                    outcome = tp_pips * pip_value - trading_cost
+                    exit_bar = j
+                    break
+                # SL hit: price rose enough (short loses)
+                if (bar_high - entry) >= sl_price:
+                    outcome = -(sl_pips * pip_value) - trading_cost
+                    exit_bar = j
+                    break
+
+            if outcome is None:
+                # Time expired — close at last bar's close
+                exit_price = closes[horizon_end - 1]
+                outcome = (entry - exit_price) - trading_cost
+                exit_bar = horizon_end - 1
+
+            trade_results.append(outcome)
+            in_trade_until = exit_bar
+
+        if len(trade_results) == 0:
+            logger.info(f"{split_name} Backtest | No trades executed")
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+
+        trade_results = np.array(trade_results)
+
+        # Win rate
+        wins = int((trade_results > 0).sum())
+        losses = int((trade_results <= 0).sum())
         win_rate = float(wins / (wins + losses)) if (wins + losses) > 0 else 0.0
 
-        trades = int((df["position"] != 0).sum())
+        # Total PnL in pips
+        total_pips = float(trade_results.sum() / pip_value)
+
+        # Per-trade Sharpe
+        avg_trade = float(trade_results.mean())
+        std_trade = float(trade_results.std(ddof=1)) if len(trade_results) > 1 else 0.0
+        sharpe_trade = (avg_trade / std_trade) * np.sqrt(252) if std_trade > 0 else 0.0
+
+        # Equity curve and drawdown (cumulative PnL)
+        cum_pnl = np.cumsum(trade_results)
+        running_max = np.maximum.accumulate(cum_pnl)
+        drawdowns = cum_pnl - running_max
+        max_dd_abs = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
+        # Express as percentage of peak equity (starting from initial notional)
+        initial_cash = float(self._get("backtesting.initial_cash", 10000.0))
+        peak_equity = initial_cash + float(running_max.max()) if len(running_max) > 0 else initial_cash
+        max_dd_pct = max_dd_abs / peak_equity if peak_equity > 0 else 0.0
+
+        # Per-bar Sharpe (spread trade PnL across all bars for comparability)
+        n_bars = len(df)
+        avg_per_bar = float(trade_results.sum()) / n_bars
+        bar_pnl = np.zeros(n_bars)
+        # Assign each trade's PnL to its entry bar
+        trade_idx = 0
+        in_trade_until2 = -1
+        for idx in sell_indices:
+            if idx <= in_trade_until2:
+                continue
+            if trade_idx >= len(trade_results):
+                break
+            bar_pnl[idx] = trade_results[trade_idx]
+            trade_idx += 1
+        std_bar = float(bar_pnl.std(ddof=1)) if n_bars > 1 else 0.0
+        sharpe_bar = (avg_per_bar / std_bar) * np.sqrt(252) if std_bar > 0 else 0.0
+
         logger.info(
-            f"{split_name} Backtest | Trades: {trades} | "
-            f"Win rate: {win_rate:.2%} | Sharpe: {sharpe:.2f} | Max DD: {max_dd:.2%}"
+            f"{split_name} Backtest | Trades: {len(trade_results)} | Win rate: {win_rate:.2%} | "
+            f"Total: {total_pips:+.0f} pips | "
+            f"Sharpe (per-bar): {sharpe_bar:.2f} | Sharpe (per-trade): {sharpe_trade:.2f} | "
+            f"Max DD: {max_dd_pct:.2%}"
         )
 
-        return sharpe, win_rate, max_dd
+        return sharpe_bar, sharpe_trade, win_rate, max_dd_pct, total_pips
 
     def run(self) -> Dict[str, Any]:
         """
@@ -464,7 +536,7 @@ class TrainingPipeline:
         pd.DataFrame(df).to_csv(processed_path, index=False)
         logger.info(f"Saved processed dataset to {processed_path}")
 
-        # Prepare arrays
+        # Prepare arrays — 3-class: Sell(0) / Range(1) / Buy(2)
         X = df[feature_cols].values
         y = pd.Series(df["label"]).map({-1: 0, 0: 1, 1: 2}).values
 
@@ -519,7 +591,7 @@ class TrainingPipeline:
         val_end = int(n * (train_ratio + val_ratio))
 
         holdout_df = df.iloc[val_end:].copy()
-        sharpe, win_rate, max_dd = self._backtest_on_split(
+        sharpe_bar, sharpe_trade, win_rate, max_dd, total_pips = self._backtest_on_split(
             result.model_path, holdout_df, feature_cols, "Holdout"
         )
 
@@ -531,8 +603,10 @@ class TrainingPipeline:
             "feature_names": result.feature_names,
             "features_used": feature_cols,
             "processed_path": processed_path,
-            "sharpe": sharpe,
+            "sharpe_bar": sharpe_bar,
+            "sharpe_trade": sharpe_trade,
             "win_rate": win_rate,
             "max_drawdown": max_dd,
+            "total_pips": total_pips,
             "class_distribution": class_dist,
         }
