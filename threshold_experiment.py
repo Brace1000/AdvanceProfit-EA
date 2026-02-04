@@ -71,7 +71,18 @@ def load_data():
     preds = np.argmax(probas, axis=1)
     max_probs = np.max(probas, axis=1)
 
-    return holdout, y_true, probas, preds, max_probs, tp_pips, sl_pips
+    # Regime filter
+    use_regime = bool(config.get("trading.regime_filter.enabled", False))
+    regime_mask = np.ones(len(holdout), dtype=bool)
+    if use_regime:
+        chop_h1_pct = float(config.get("trading.regime_filter.chop_h1_percentile", 50))
+        chop_h4_pct = float(config.get("trading.regime_filter.chop_h4_percentile", 50))
+        chop_h1_thresh = np.percentile(holdout["choppiness_h1"].dropna(), chop_h1_pct)
+        chop_h4_thresh = np.percentile(holdout["choppiness_h4"].dropna(), chop_h4_pct)
+        regime_mask = (holdout["choppiness_h1"].values < chop_h1_thresh) & \
+                      (holdout["choppiness_h4"].values < chop_h4_thresh)
+
+    return holdout, y_true, probas, preds, max_probs, tp_pips, sl_pips, regime_mask, use_regime
 
 
 def main():
@@ -83,7 +94,7 @@ def main():
     print("THRESHOLD EXPERIMENT — 3-class model, Sell-only trading")
     print("=" * 80)
 
-    holdout, y_true, probas, preds, max_probs, tp_pips, sl_pips = load_data()
+    holdout, y_true, probas, preds, max_probs, tp_pips, sl_pips, regime_mask, use_regime = load_data()
 
     be_rate = sl_pips / (tp_pips + sl_pips) * 100
     sell_base_rate = (y_true == 0).mean() * 100
@@ -97,6 +108,8 @@ def main():
     print(f"Holdout samples: {len(holdout)}")
     print(f"Actual Sell rate: {sell_base_rate:.1f}%")
     print(f"Overall accuracy: {(preds == y_true).mean():.1%}")
+    if use_regime:
+        print(f"Regime filter: ON (chop_h1+h4 below median, {regime_mask.sum()}/{len(holdout)} bars pass)")
     print(f"Sell probability range: [{sell_probs.min():.4f}, {sell_probs.max():.4f}]")
 
     if sell_pred_mask.sum() > 0:
@@ -115,8 +128,8 @@ def main():
     total_sell = (y_true == 0).sum()
 
     for thresh in THRESHOLDS:
-        # Only trade when model predicts Sell AND confidence >= threshold
-        signals = (preds == 0) & (max_probs >= thresh)
+        # Only trade when model predicts Sell AND confidence >= threshold AND regime allows
+        signals = (preds == 0) & (max_probs >= thresh) & regime_mask
         n_trades = signals.sum()
 
         if n_trades == 0:
@@ -154,9 +167,10 @@ def main():
     print("SELL PREDICTION CONFIDENCE DISTRIBUTION")
     print("=" * 80)
 
-    if sell_pred_mask.sum() > 0:
-        sell_confidences = max_probs[sell_pred_mask]
-        sell_actual = y_true[sell_pred_mask]
+    regime_sell_mask = sell_pred_mask & regime_mask
+    if regime_sell_mask.sum() > 0:
+        sell_confidences = max_probs[regime_sell_mask]
+        sell_actual = y_true[regime_sell_mask]
 
         bins = [(0.30, 0.35), (0.35, 0.40), (0.40, 0.45), (0.45, 0.50),
                 (0.50, 0.60), (0.60, 0.70), (0.70, 1.00)]

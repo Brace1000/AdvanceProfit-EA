@@ -353,6 +353,27 @@ class TrainingPipeline:
                 f"({sell_signals/total_signals:.1%}) above threshold={confidence_threshold}"
             )
 
+            # Regime filter: only trade when both timeframes are trending
+            use_regime = bool(self._get("trading.regime_filter.enabled", False))
+            if use_regime:
+                chop_h1_pct = float(self._get("trading.regime_filter.chop_h1_percentile", 50))
+                chop_h4_pct = float(self._get("trading.regime_filter.chop_h4_percentile", 50))
+
+                chop_h1_thresh = np.percentile(df["choppiness_h1"].dropna(), chop_h1_pct)
+                chop_h4_thresh = np.percentile(df["choppiness_h4"].dropna(), chop_h4_pct)
+
+                regime_mask = (df["choppiness_h1"].values < chop_h1_thresh) & \
+                              (df["choppiness_h4"].values < chop_h4_thresh)
+
+                before = int(sell_mask.sum())
+                sell_mask = sell_mask & regime_mask
+                after = int(sell_mask.sum())
+
+                logger.info(
+                    f"  Regime filter (chop_h1<{chop_h1_thresh:.1f}, chop_h4<{chop_h4_thresh:.1f}): "
+                    f"{before} → {after} signals ({after/before:.0%} retained)"
+                )
+
         except Exception as e:
             logger.error(f"Failed to load model for backtest: {e}")
             return 0.0, 0.0, 0.0, 0.0, 0.0
@@ -369,13 +390,29 @@ class TrainingPipeline:
         lows = df["low"].values
         sell_indices = np.where(sell_mask)[0]
 
+        # Circuit breaker parameters
+        use_cb = bool(self._get("trading.circuit_breaker.enabled", False))
+        cb_max_losses = int(self._get("trading.circuit_breaker.max_consecutive_losses", 5))
+        cb_max_dd_pips = float(self._get("trading.circuit_breaker.max_drawdown_pips", 100))
+        cb_cooldown = int(self._get("trading.circuit_breaker.cooldown_bars", 48))
+        cb_reset_on_win = bool(self._get("trading.circuit_breaker.reset_on_win", True))
+
         # Simulate trades: for each Sell signal, scan forward for barrier hit
         trade_results = []  # PnL in price units per trade
         in_trade_until = -1  # prevents overlapping trades
+        consecutive_losses = 0
+        peak_pnl = 0.0
+        running_pnl = 0.0
+        paused_until = -1  # bar index until which trading is paused
+        cb_triggers = 0
 
         for idx in sell_indices:
             if idx <= in_trade_until:
                 continue  # skip if already in a trade
+
+            # Circuit breaker: skip if paused
+            if use_cb and idx < paused_until:
+                continue
 
             entry = closes[idx]
             tp_price = tp_pips * pip_value
@@ -411,6 +448,28 @@ class TrainingPipeline:
 
             trade_results.append(outcome)
             in_trade_until = exit_bar
+
+            # Circuit breaker logic
+            if use_cb:
+                running_pnl += outcome
+                peak_pnl = max(peak_pnl, running_pnl)
+                dd_pips = (peak_pnl - running_pnl) / pip_value
+
+                if outcome <= 0:
+                    consecutive_losses += 1
+                elif cb_reset_on_win:
+                    consecutive_losses = 0
+
+                if consecutive_losses >= cb_max_losses or dd_pips >= cb_max_dd_pips:
+                    paused_until = exit_bar + cb_cooldown
+                    cb_triggers += 1
+                    consecutive_losses = 0  # reset after pause
+
+        if use_cb and cb_triggers > 0:
+            logger.info(
+                f"  Circuit breaker triggered {cb_triggers} time(s), "
+                f"cooldown={cb_cooldown} bars"
+            )
 
         if len(trade_results) == 0:
             logger.info(f"{split_name} Backtest | No trades executed")

@@ -50,7 +50,7 @@ class PredictionRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "features": [0.0] * 11
+                "features": [0.0] * 14
             }
         }
 

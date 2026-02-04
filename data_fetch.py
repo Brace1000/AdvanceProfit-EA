@@ -133,7 +133,6 @@ def main():
     cfg = get_config()
     default_symbol = cfg.get("data_collection.symbol", "EURUSD")
     default_tf = cfg.get("data_collection.timeframe", "D1")
-    default_csv = cfg.get("paths.data_raw_file", f"{default_symbol}_{default_tf}_raw.csv") or "EURUSD_D1_raw.csv"
 
     parser.add_argument("--symbol", default=default_symbol, help=f"Symbol to download (default: {default_symbol})")
     parser.add_argument("--timeframe", default=default_tf, help=f"Timeframe (default: {default_tf})")
@@ -144,7 +143,7 @@ def main():
 
     parser.add_argument("--end", type=str, help="End date YYYY-MM-DD for range fetch")
 
-    parser.add_argument("--csv", default=default_csv, help=f"Output CSV path (default: {default_csv})")
+    parser.add_argument("--csv", default=None, help="Output CSV path (default: {SYMBOL}_{TIMEFRAME}_raw.csv)")
     parser.add_argument("--append", action="store_true", help="Append/merge with existing CSV by time")
     parser.add_argument("--terminal-path", type=str, help="Path to terminal64.exe if MT5 cannot be auto-initialized")
     parser.add_argument("--login", type=int, help="MT5 account login number (optional)")
@@ -152,6 +151,10 @@ def main():
     parser.add_argument("--server", type=str, help="MT5 trade server name (optional)")
 
     args = parser.parse_args()
+
+    # Construct CSV filename from symbol/timeframe if not explicitly provided
+    if args.csv is None:
+        args.csv = f"{args.symbol}_{args.timeframe}_raw.csv"
 
     try:
         timeframe = parse_timeframe(args.timeframe)

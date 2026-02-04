@@ -155,6 +155,22 @@ trading:
     min_atr: 0.0001
     use_trend_filter: true
 
+  # Regime filter — only trade when both timeframes are trending (low choppiness)
+  regime_filter:
+    enabled: true
+    # Choppiness percentile threshold: only trade when choppiness is below this
+    # percentile of the training data. Lower = stricter (more trending required)
+    chop_h1_percentile: 50   # Below median choppiness on H1
+    chop_h4_percentile: 50   # Below median choppiness on H4
+
+  # Circuit breaker — pause trading after consecutive losses or drawdown
+  circuit_breaker:
+    enabled: true
+    max_consecutive_losses: 5     # Pause after N consecutive losing trades
+    max_drawdown_pips: 100        # Pause after losing X pips from peak
+    cooldown_bars: 48             # Stay out for N bars after triggering (48 = 2 days on H1)
+    reset_on_win: true            # Reset consecutive loss counter on a win
+
 # Data Collection
 data_collection:
   symbol: "EURUSD"
@@ -212,5 +228,5 @@ paths:
   logs: "logs"
   experiments: "experiments"
   notebooks: "notebooks"
-  data_raw_file: "EURUSD_H1_raw.csv"
+  data_raw_file: "EURUSD_H1_clean.csv"
   data_processed_file: "EURUSD_H1_clean.csv"

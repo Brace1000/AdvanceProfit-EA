@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                     AdvancedProfitEA_ML.mq5      |
-//|                   Advanced Trading System with ML Integration     |
+//|                   Sell-Only ML Trading System (14 features)       |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
-#property version   "2.30"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -12,64 +12,91 @@
 
 // Input Parameters
 input group "=== ML API Settings ==="
-input bool   UseMLPredictions = true;        // Use ML predictions
 input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
-input double ML_Confidence_Threshold = 0.40; // Minimum confidence (40%)
-input bool   CombineWithTechnical = false;    // Combine ML with technical signals
+input double ML_Confidence_Threshold = 0.34; // Minimum confidence (34%)
 
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
 input double MaxDailyLoss = 3.0;             // Max daily loss (% of balance)
 input double MaxDailyProfit = 5.0;           // Daily profit target (%)
-input int    MaxSimultaneousTrades = 3;      // Maximum open positions
-input bool   UseTrailingStop = true;         // Enable trailing stop
-input double TrailingStopPips = 30;          // Trailing stop distance (pips)
-input double TrailingStepPips = 10;          // Trailing step (pips)
+input int    MaxSimultaneousTrades = 1;      // Maximum open positions
+input double TP_Pips = 20.0;                // Take Profit (pips) - fixed barrier
+input double SL_Pips = 15.0;                // Stop Loss (pips) - fixed barrier
 
-input group "=== Strategy Settings ==="
+input group "=== Technical Strategy ==="
 input int    MA_Fast = 10;                   // Fast MA Period
 input int    MA_Slow = 30;                   // Slow MA Period
 input int    RSI_Period = 14;                // RSI Period
 input int    RSI_Overbought = 70;            // RSI Overbought Level
 input int    RSI_Oversold = 30;              // RSI Oversold Level
-input int    ATR_Period = 14;                // ATR Period for volatility
-input double ATR_Multiplier = 2.0;           // ATR multiplier for SL/TP
+input int    TrendMA_Period = 50;            // Trend MA Period
+input bool   UseTrendFilter = true;          // Only trade with trend
+input bool   TechnicalOnly = false;           // Technical signals only (no ML)
+input bool   CombineWithTechnical = false;   // Require both ML + Technical (ignored if TechnicalOnly)
 
 input group "=== Trade Filters ==="
-input bool   UseTrendFilter = true;          // Only trade with trend
-input int    TrendMA_Period = 50;            // Trend MA Period
 input bool   UseTimeFilter = true;           // Enable time filter
 input int    StartHour = 8;                  // Trading start hour
 input int    EndHour = 20;                   // Trading end hour
-input bool   UseVolatilityFilter = true;     // Filter low volatility
-input double MinATR = 0.0001;                // Minimum ATR value
+
+input group "=== Regime Filter ==="
+input bool   UseRegimeFilter = true;         // Only trade in trending regimes
+input int    RegimeLookback = 500;           // Bars for rolling median
+
+input group "=== Circuit Breaker ==="
+input bool   CB_Enabled = true;              // Enable circuit breaker
+input int    CB_MaxConsecLosses = 5;         // Max consecutive losses before pause
+input double CB_MaxDrawdownPips = 100.0;     // Max drawdown (pips) before pause
+input int    CB_CooldownBars = 48;           // Bars to pause after trigger
+input bool   CB_ResetOnWin = true;           // Reset loss counter on win
 
 input group "=== Position Management ==="
-input bool   UsePartialClose = true;         // Partial close at targets
-input double PartialClosePercent = 50.0;     // % to close at first target
+input bool   UseTrailingStop = true;         // Enable trailing stop
+input double TrailingStopPips = 30;          // Trailing stop distance (pips)
+input double TrailingStepPips = 10;          // Trailing step (pips)
 input bool   UseBreakeven = true;            // Move SL to breakeven
 input double BreakevenTriggerPips = 20;      // Pips profit to trigger BE
 input double BreakevenOffsetPips = 5;        // BE offset (pips)
+input bool   UsePartialClose = true;         // Partial close at targets
+input double PartialClosePercent = 50.0;     // % to close at first target
 
 // Global Variables
 CTrade trade;
 CPositionInfo posInfo;
 CAccountInfo accInfo;
 
+// Technical indicator handles
 int handleMA_Fast, handleMA_Slow, handleRSI, handleATR, handleTrendMA;
 
 // ML indicator handles (H1 + H4)
-int handleEMA50_H1, handleEMA200_H1, handleADX_H1, handleRSI_H1, handleATR_H1;
-int handleEMA50_H4, handleEMA200_H4, handleADX_H4, handleRSI_H4, handleATR_H4;
+int handleEMA50_H1, handleEMA200_H1, handleRSI_H1, handleATR_H1;
+int handleEMA50_H4, handleEMA200_H4, handleATR_H4;
 
 double dailyStartBalance;
 datetime lastBarTime;
 int totalTradesToday = 0;
 double dailyProfitLoss = 0.0;
 
-// Forward declarations for helper functions
+// Circuit breaker state
+int    cb_consecutive_losses = 0;
+double cb_peak_pnl = 0.0;
+double cb_running_pnl = 0.0;
+int    cb_bar_counter = 0;
+int    cb_paused_until_bar = 0;
+int    cb_triggers = 0;
+int    cb_last_position_count = 0;
+
+// Regime filter cached values (updated each bar)
+double last_chop_h1 = 50.0;
+double last_chop_h4 = 50.0;
+
+// Forward declarations
 string StringTrimCustom(const string str);
 double StringToDoubleCustom(const string value);
+double ComputeSqueezeRatio(ENUM_TIMEFRAMES tf, int shift);
+double ComputeChoppiness(ENUM_TIMEFRAMES tf, int shift);
+double ComputeSimplifiedADX(ENUM_TIMEFRAMES tf, int shift);
+double ComputeRollingMedian(ENUM_TIMEFRAMES tf, int shift, int lookback);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -77,54 +104,62 @@ double StringToDoubleCustom(const string value);
 int OnInit()
 {
    Print("========================================");
-   Print("Advanced Profit EA v2.30 with ML (23 features after pruning)");
+   Print("Advanced Profit EA v3.00 - Sell-Only ML (14 features)");
    Print("========================================");
-   
-   // Initialize indicators (for technical strategy on current chart timeframe)
+
+   // Technical indicators
    handleMA_Fast = iMA(_Symbol, _Period, MA_Fast, 0, MODE_SMA, PRICE_CLOSE);
    handleMA_Slow = iMA(_Symbol, _Period, MA_Slow, 0, MODE_SMA, PRICE_CLOSE);
    handleRSI = iRSI(_Symbol, _Period, RSI_Period, PRICE_CLOSE);
-   handleATR = iATR(_Symbol, _Period, ATR_Period);
+   handleATR = iATR(_Symbol, _Period, 14);
    handleTrendMA = iMA(_Symbol, _Period, TrendMA_Period, 0, MODE_SMA, PRICE_CLOSE);
-   
-   // ML-specific indicators (H1 and H4 timeframes)
-   handleEMA50_H1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
-   handleEMA200_H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
-   handleADX_H1 = iADX(_Symbol, PERIOD_H1, 14);
-   handleRSI_H1 = iRSI(_Symbol, PERIOD_H1, RSI_Period, PRICE_CLOSE);
-   handleATR_H1 = iATR(_Symbol, PERIOD_H1, ATR_Period);
 
-   handleEMA50_H4 = iMA(_Symbol, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
+   // ML indicators: H1
+   handleEMA50_H1  = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
+   handleEMA200_H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   handleRSI_H1    = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+   handleATR_H1    = iATR(_Symbol, PERIOD_H1, 14);
+
+   // ML indicators: H4
+   handleEMA50_H4  = iMA(_Symbol, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
    handleEMA200_H4 = iMA(_Symbol, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE);
-   handleADX_H4 = iADX(_Symbol, PERIOD_H4, 14);
-   handleRSI_H4 = iRSI(_Symbol, PERIOD_H4, RSI_Period, PRICE_CLOSE);
-   handleATR_H4 = iATR(_Symbol, PERIOD_H4, ATR_Period);
-   
+   handleATR_H4    = iATR(_Symbol, PERIOD_H4, 14);
+
    if(handleMA_Fast == INVALID_HANDLE || handleMA_Slow == INVALID_HANDLE ||
-      handleRSI == INVALID_HANDLE || handleATR == INVALID_HANDLE || 
+      handleRSI == INVALID_HANDLE || handleATR == INVALID_HANDLE ||
       handleTrendMA == INVALID_HANDLE ||
       handleEMA50_H1 == INVALID_HANDLE || handleEMA200_H1 == INVALID_HANDLE ||
-      handleADX_H1 == INVALID_HANDLE || handleRSI_H1 == INVALID_HANDLE || handleATR_H1 == INVALID_HANDLE ||
+      handleRSI_H1 == INVALID_HANDLE || handleATR_H1 == INVALID_HANDLE ||
       handleEMA50_H4 == INVALID_HANDLE || handleEMA200_H4 == INVALID_HANDLE ||
-      handleADX_H4 == INVALID_HANDLE || handleRSI_H4 == INVALID_HANDLE || handleATR_H4 == INVALID_HANDLE)
+      handleATR_H4 == INVALID_HANDLE)
    {
       Print("Error initializing indicators!");
       return(INIT_FAILED);
    }
-   
+
    dailyStartBalance = accInfo.Balance();
    lastBarTime = 0;
-   
+
    trade.SetExpertMagicNumber(123456);
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
-   
-   Print("ML Integration: ", UseMLPredictions ? "ENABLED" : "DISABLED");
-   Print("API URL: ", API_URL);
-   Print("ML Confidence Threshold: ", ML_Confidence_Threshold);
+
+   Print("Mode: ", TechnicalOnly ? "TECHNICAL ONLY (no ML)" :
+         (CombineWithTechnical ? "ML + Technical Confluence" : "ML-Only"));
+   if(!TechnicalOnly)
+   {
+      Print("API URL: ", API_URL);
+      Print("Confidence Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
+   }
+   Print("TP: ", TP_Pips, " pips | SL: ", SL_Pips, " pips");
+   Print("Technical: MA(", MA_Fast, ",", MA_Slow, ") + RSI(", RSI_Period, ") + Trend(", TrendMA_Period, ")");
+   Print("Regime Filter: ", UseRegimeFilter ? "ON" : "OFF");
+   Print("Circuit Breaker: ", CB_Enabled ? "ON" : "OFF");
    Print("Risk per trade: ", RiskPercent, "%");
-   Print("Starting balance: $", dailyStartBalance);
-   
+   Print("Starting balance: $", DoubleToString(dailyStartBalance, 2));
+
+   cb_last_position_count = CountOpenPositions();
+
    return(INIT_SUCCEEDED);
 }
 
@@ -141,18 +176,16 @@ void OnDeinit(const int reason)
 
    IndicatorRelease(handleEMA50_H1);
    IndicatorRelease(handleEMA200_H1);
-   IndicatorRelease(handleADX_H1);
    IndicatorRelease(handleRSI_H1);
    IndicatorRelease(handleATR_H1);
 
    IndicatorRelease(handleEMA50_H4);
    IndicatorRelease(handleEMA200_H4);
-   IndicatorRelease(handleADX_H4);
-   IndicatorRelease(handleRSI_H4);
    IndicatorRelease(handleATR_H4);
-   
+
    Print("EA Stopped. Total trades today: ", totalTradesToday);
-   Print("Daily P&L: $", dailyProfitLoss);
+   Print("Daily P&L: $", DoubleToString(dailyProfitLoss, 2));
+   Print("Circuit breaker triggers: ", cb_triggers);
 }
 
 //+------------------------------------------------------------------+
@@ -160,185 +193,382 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   // Check for closed trades (circuit breaker tracking)
+   if(CB_Enabled)
+      CheckClosedTrades();
+
+   datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
    bool isNewBar = (currentBarTime != lastBarTime);
-   
+
    if(isNewBar)
    {
       lastBarTime = currentBarTime;
-      
+      cb_bar_counter++;
+
       CheckDailyReset();
-      
+
       if(!CheckDailyLimits())
       {
          CloseAllPositions("Daily limit reached");
          return;
       }
-      
+
       if(UseTrailingStop)
          ManageTrailingStops();
-      
+
       ManagePositions();
-      
+
+      // Circuit breaker check
+      if(CB_Enabled && cb_bar_counter < cb_paused_until_bar)
+      {
+         Print("Circuit breaker active - paused until bar ", cb_paused_until_bar,
+               " (current: ", cb_bar_counter, ")");
+         return;
+      }
+
       if(CountOpenPositions() < MaxSimultaneousTrades)
       {
          int signal = GetTradeSignal();
-         
-         if(signal == 1)
-            OpenTrade(ORDER_TYPE_BUY);
-         else if(signal == -1)
-            OpenTrade(ORDER_TYPE_SELL);
+
+         if(signal == -1)
+            OpenSellTrade();
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Get ML prediction from Python API (H1 + H4 features)             |
+//| Get technical signal (MA crossover + RSI)                         |
 //+------------------------------------------------------------------+
-int GetMLPrediction(double &confidence)
+int GetTechnicalSignal()
 {
-   if(!UseMLPredictions)
+   double maFast[], maSlow[], rsi[], trendMA[];
+   ArraySetAsSeries(maFast, true);
+   ArraySetAsSeries(maSlow, true);
+   ArraySetAsSeries(rsi, true);
+   ArraySetAsSeries(trendMA, true);
+
+   if(CopyBuffer(handleMA_Fast, 0, 0, 3, maFast) < 3 ||
+      CopyBuffer(handleMA_Slow, 0, 0, 3, maSlow) < 3 ||
+      CopyBuffer(handleRSI, 0, 0, 1, rsi) < 1 ||
+      CopyBuffer(handleTrendMA, 0, 0, 1, trendMA) < 1)
       return 0;
-   
-   // H1 indicator buffers
-   double ema50_h1[2], ema200_h1[2], rsi_h1[2], atr_h1[2], adx_h1[2];
+
+   double close = iClose(_Symbol, _Period, 1);
+
+   bool upTrend = close > trendMA[0];
+   bool downTrend = close < trendMA[0];
+
+   // Bearish crossover: fast MA crosses below slow MA
+   bool bearishCross = (maFast[1] < maSlow[1] && maFast[2] >= maSlow[2]);
+
+   // RSI in bearish zone
+   bool rsiBearish = rsi[0] < 50 && rsi[0] > RSI_Oversold;
+
+   if(bearishCross && rsiBearish)
+   {
+      if(!UseTrendFilter || downTrend)
+      {
+         Print("Technical SELL: Bearish cross + RSI=", DoubleToString(rsi[0], 1));
+         return -1;
+      }
+   }
+
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Compute Squeeze Ratio (BB width / KC width)                      |
+//| Matches Python: engineer.py _squeeze_ratio()                     |
+//+------------------------------------------------------------------+
+double ComputeSqueezeRatio(ENUM_TIMEFRAMES tf, int shift)
+{
+   // BB width = 4 * StdDev(close, 20)
+   double closes[];
+   ArraySetAsSeries(closes, true);
+   if(CopyClose(_Symbol, tf, shift, 20, closes) < 20)
+      return 1.0;
+
+   double sum = 0, sum2 = 0;
+   for(int i = 0; i < 20; i++)
+   {
+      sum += closes[i];
+      sum2 += closes[i] * closes[i];
+   }
+   double mean = sum / 20.0;
+   double variance = sum2 / 20.0 - mean * mean;
+   double std_dev = MathSqrt(MathMax(0.0, variance));
+   double bb_width = 4.0 * std_dev;
+
+   // KC width = 2 * SMA(ATR(14), 20)
+   double atr_vals[];
+   ArraySetAsSeries(atr_vals, true);
+   int atr_handle = (tf == PERIOD_H1) ? handleATR_H1 : handleATR_H4;
+   if(CopyBuffer(atr_handle, 0, shift, 20, atr_vals) < 20)
+      return 1.0;
+
+   double atr_sum = 0;
+   for(int i = 0; i < 20; i++)
+      atr_sum += atr_vals[i];
+   double avg_atr = atr_sum / 20.0;
+   double kc_width = 2.0 * avg_atr;
+
+   if(kc_width < 1e-10)
+      return 1.0;
+
+   return bb_width / kc_width;
+}
+
+//+------------------------------------------------------------------+
+//| Compute Choppiness Index (14-period)                             |
+//| Matches Python: engineer.py _choppiness()                        |
+//| Values near 100 = choppy/ranging, near 0 = trending              |
+//+------------------------------------------------------------------+
+double ComputeChoppiness(ENUM_TIMEFRAMES tf, int shift)
+{
+   int period = 14;
+
+   double highs[], lows[], closes[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows, true);
+   ArraySetAsSeries(closes, true);
+
+   // Need period bars + 1 previous close for TR calculation
+   if(CopyHigh(_Symbol, tf, shift, period, highs) < period ||
+      CopyLow(_Symbol, tf, shift, period, lows) < period ||
+      CopyClose(_Symbol, tf, shift, period + 1, closes) < period + 1)
+      return 50.0;
+
+   double tr_sum = 0;
+   double high_max = -DBL_MAX;
+   double low_min = DBL_MAX;
+
+   for(int i = 0; i < period; i++)
+   {
+      double prev_close = closes[i + 1]; // previous close (series: i+1 is older)
+      double h = highs[i];
+      double l = lows[i];
+
+      double tr = MathMax(h - l, MathMax(MathAbs(h - prev_close), MathAbs(l - prev_close)));
+      tr_sum += tr;
+
+      high_max = MathMax(high_max, h);
+      low_min = MathMin(low_min, l);
+   }
+
+   double price_range = high_max - low_min;
+   if(price_range < 1e-10)
+      return 50.0;
+
+   double chop = 100.0 * MathLog10(tr_sum / price_range) / MathLog10((double)period);
+   return MathMax(0.0, MathMin(100.0, chop));
+}
+
+//+------------------------------------------------------------------+
+//| Compute Simplified ADX (NOT standard iADX)                       |
+//| Matches Python: engineer.py _adx_like()                          |
+//| = SMA(14) of |plus_dm - minus_dm|                                |
+//+------------------------------------------------------------------+
+double ComputeSimplifiedADX(ENUM_TIMEFRAMES tf, int shift)
+{
+   int period = 14;
+
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows, true);
+
+   // Need period + 1 bars for diff calculation
+   if(CopyHigh(_Symbol, tf, shift, period + 1, highs) < period + 1 ||
+      CopyLow(_Symbol, tf, shift, period + 1, lows) < period + 1)
+      return 0.0;
+
+   double sum = 0;
+   for(int i = 0; i < period; i++)
+   {
+      // diff: highs[i] - highs[i+1] (i+1 is older in series mode)
+      double plus_dm = MathMax(highs[i] - highs[i + 1], 0.0);
+      double minus_dm = MathMax(lows[i + 1] - lows[i], 0.0);
+      sum += MathAbs(plus_dm - minus_dm);
+   }
+
+   return sum / period;
+}
+
+//+------------------------------------------------------------------+
+//| Compute rolling median of choppiness for regime filter            |
+//+------------------------------------------------------------------+
+double ComputeRollingMedian(ENUM_TIMEFRAMES tf, int shift, int lookback)
+{
+   double values[];
+   ArrayResize(values, lookback);
+   int count = 0;
+
+   for(int i = shift; i < shift + lookback && count < lookback; i++)
+   {
+      double chop = ComputeChoppiness(tf, i);
+      if(chop > 0 && chop < 100)
+      {
+         values[count] = chop;
+         count++;
+      }
+   }
+
+   if(count < 10)
+      return 50.0; // Not enough data, use neutral value
+
+   // Sort for median
+   ArrayResize(values, count);
+   ArraySort(values);
+
+   if(count % 2 == 0)
+      return (values[count / 2 - 1] + values[count / 2]) / 2.0;
+   else
+      return values[count / 2];
+}
+
+//+------------------------------------------------------------------+
+//| Get ML prediction from Python API (14 features)                  |
+//| Feature order matches features_used.json exactly                 |
+//+------------------------------------------------------------------+
+int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out)
+{
+   // --- H1 indicator buffers ---
+   double ema50_h1[3], ema200_h1[3], rsi_h1[2], atr_h1[2];
    double close_h1[3], open_h1[2], high_h1[2], low_h1[2];
 
-   // H4 indicator buffers
-   double ema50_h4[2], ema200_h4[2], rsi_h4[2], atr_h4[2], adx_h4[2];
+   // --- H4 indicator buffers ---
+   double ema50_h4[3], ema200_h4[3], atr_h4[2];
    double close_h4[3], open_h4[2], high_h4[2], low_h4[2];
-   
+
    ArraySetAsSeries(ema50_h1, true); ArraySetAsSeries(ema200_h1, true);
    ArraySetAsSeries(rsi_h1, true);   ArraySetAsSeries(atr_h1, true);
-   ArraySetAsSeries(adx_h1, true);
    ArraySetAsSeries(close_h1, true); ArraySetAsSeries(open_h1, true);
    ArraySetAsSeries(high_h1, true);  ArraySetAsSeries(low_h1, true);
 
    ArraySetAsSeries(ema50_h4, true); ArraySetAsSeries(ema200_h4, true);
-   ArraySetAsSeries(rsi_h4, true);   ArraySetAsSeries(atr_h4, true);
-   ArraySetAsSeries(adx_h4, true);
+   ArraySetAsSeries(atr_h4, true);
    ArraySetAsSeries(close_h4, true); ArraySetAsSeries(open_h4, true);
    ArraySetAsSeries(high_h4, true);  ArraySetAsSeries(low_h4, true);
-   
-   // Copy H1 indicators
-   if(CopyBuffer(handleEMA50_H1, 0, 0, 2, ema50_h1) < 2 ||
-      CopyBuffer(handleEMA200_H1, 0, 0, 2, ema200_h1) < 2 ||
+
+   // Copy H1 indicators (need 3 bars for EMA shift)
+   if(CopyBuffer(handleEMA50_H1, 0, 0, 3, ema50_h1) < 3 ||
+      CopyBuffer(handleEMA200_H1, 0, 0, 3, ema200_h1) < 3 ||
       CopyBuffer(handleRSI_H1, 0, 0, 2, rsi_h1) < 2 ||
-      CopyBuffer(handleATR_H1, 0, 0, 2, atr_h1) < 2 ||
-      CopyBuffer(handleADX_H1, 0, 0, 2, adx_h1) < 2)
+      CopyBuffer(handleATR_H1, 0, 0, 2, atr_h1) < 2)
    {
-      Print("Failed to copy H1 indicator data for ML");
+      Print("Failed to copy H1 indicator data");
       return 0;
    }
+
    // Copy H1 prices
    if(CopyClose(_Symbol, PERIOD_H1, 0, 3, close_h1) < 3 ||
       CopyOpen(_Symbol, PERIOD_H1, 0, 2, open_h1) < 2 ||
       CopyHigh(_Symbol, PERIOD_H1, 0, 2, high_h1) < 2 ||
       CopyLow(_Symbol, PERIOD_H1, 0, 2, low_h1) < 2)
    {
-      Print("Failed to copy H1 price data for ML");
+      Print("Failed to copy H1 price data");
       return 0;
    }
 
-   // Copy H4 indicators
-   if(CopyBuffer(handleEMA50_H4, 0, 0, 2, ema50_h4) < 2 ||
-      CopyBuffer(handleEMA200_H4, 0, 0, 2, ema200_h4) < 2 ||
-      CopyBuffer(handleRSI_H4, 0, 0, 2, rsi_h4) < 2 ||
-      CopyBuffer(handleATR_H4, 0, 0, 2, atr_h4) < 2 ||
-      CopyBuffer(handleADX_H4, 0, 0, 2, adx_h4) < 2)
+   // Copy H4 indicators (need 3 bars for EMA shift)
+   if(CopyBuffer(handleEMA50_H4, 0, 0, 3, ema50_h4) < 3 ||
+      CopyBuffer(handleEMA200_H4, 0, 0, 3, ema200_h4) < 3 ||
+      CopyBuffer(handleATR_H4, 0, 0, 2, atr_h4) < 2)
    {
-      Print("Failed to copy H4 indicator data for ML");
+      Print("Failed to copy H4 indicator data");
       return 0;
    }
+
    // Copy H4 prices
    if(CopyClose(_Symbol, PERIOD_H4, 0, 3, close_h4) < 3 ||
       CopyOpen(_Symbol, PERIOD_H4, 0, 2, open_h4) < 2 ||
       CopyHigh(_Symbol, PERIOD_H4, 0, 2, high_h4) < 2 ||
       CopyLow(_Symbol, PERIOD_H4, 0, 2, low_h4) < 2)
    {
-      Print("Failed to copy H4 price data for ML");
+      Print("Failed to copy H4 price data");
       return 0;
    }
 
-   // Compute H1 features (excluding adx_h1 - pruned due to correlation with atr_ratio_h1)
-   double close_ema50_h1 = ema50_h1[0];
-   double ema50_ema200_h1 = ema50_h1[0] - ema200_h1[0];
-   double rsi_val_h1 = rsi_h1[0];
-   double rsi_slope_h1 = rsi_h1[0] - rsi_h1[1];
-   double atr_ratio_h1 = atr_h1[0] / close_h1[0];
-   // double adx_val_h1 = adx_h1[0]; // PRUNED: corr=0.880 with atr_ratio_h1
-   double body_h1 = close_h1[0] - open_h1[0];
-   double range_h1 = high_h1[0] - low_h1[0];
-   
-   // Hour and session from server time
-   MqlDateTime now;
-   TimeToStruct(TimeCurrent(), now);
-   double hour = now.hour;
+   // === Compute 14 features (exact order from features_used.json) ===
 
-   // One-hot encode session (3 binary features: Asian/European/American)
-   // Aligned with Python training: 0-8=Asian, 8-16=European, 16-24=American
-   double session_asian = 0, session_european = 0, session_american = 0;
-   if(now.hour >= 0 && now.hour < 8)
-      session_asian = 1;
-   else if(now.hour >= 8 && now.hour < 16)
-      session_european = 1;
-   else
-      session_american = 1;
+   // 1. close_ema50_h1: (close - ema50) / ema50, bar index 1 (shift 1)
+   double f01_close_ema50_h1 = (close_h1[1] - ema50_h1[1]) / (ema50_h1[1] + 1e-10);
 
-   // One-hot encode day of week (5 binary features: Monday=1, Friday=5)
-   double dow_monday = 0, dow_tuesday = 0, dow_wednesday = 0, dow_thursday = 0, dow_friday = 0;
-   if(now.day_of_week == 1) dow_monday = 1;
-   else if(now.day_of_week == 2) dow_tuesday = 1;
-   else if(now.day_of_week == 3) dow_wednesday = 1;
-   else if(now.day_of_week == 4) dow_thursday = 1;
-   else if(now.day_of_week == 5) dow_friday = 1;
+   // 2. ema50_ema200_h1: (ema50 - ema200) / close, bar index 2 (extra EMA lag)
+   double f02_ema50_ema200_h1 = (ema50_h1[2] - ema200_h1[2]) / (close_h1[2] + 1e-10);
 
-   // double prev_return_h1 = 0.0; // PRUNED: corr=0.957 with body_h1
-   // if(close_h1[1] != 0.0)
-   //    prev_return_h1 = (close_h1[0] - close_h1[1]) / close_h1[1];
+   // 3. rsi_h1: standard RSI, bar index 1
+   double f03_rsi_h1 = rsi_h1[1];
 
-   // Compute H4 features
-   // double close_ema50_h4 = ema50_h4[0]; // PRUNED: corr=0.988 with close_ema50_h1
-   double ema50_ema200_h4 = ema50_h4[0] - ema200_h4[0];
-   double rsi_val_h4 = rsi_h4[0];
-   double rsi_slope_h4 = rsi_h4[0] - rsi_h4[1];
-   double atr_ratio_h4 = atr_h4[0] / close_h4[0];
-   double adx_val_h4 = adx_h4[0];
-   double body_h4 = close_h4[0] - open_h4[0];
-   double range_h4 = high_h4[0] - low_h4[0];
+   // 4. atr_ratio_h1: atr / close, bar index 1
+   double f04_atr_ratio_h1 = atr_h1[1] / (close_h1[1] + 1e-10);
 
-   // double prev_return_h4 = 0.0; // PRUNED: corr=0.987 with body_h4
-   // if(close_h4[1] != 0.0)
-   //    prev_return_h4 = (close_h4[0] - close_h4[1]) / close_h4[1];
+   // 5. squeeze_ratio_h1: BB_width / KC_width, bar index 1
+   double f05_squeeze_h1 = ComputeSqueezeRatio(PERIOD_H1, 1);
 
-   // Build JSON request with 23 features (after correlation pruning) in exact order expected by Python
-   // Pruned features: close_ema50_h4, adx_h1, prev_return_h1, prev_return_h4
+   // 6. choppiness_h1: choppiness index, bar index 1
+   double f06_chop_h1 = ComputeChoppiness(PERIOD_H1, 1);
+   chop_h1_out = f06_chop_h1; // Output for regime filter
+
+   // 7. body_ratio_h1: (close - open) / (high - low), bar index 1
+   double range_h1 = high_h1[1] - low_h1[1];
+   double f07_body_ratio_h1 = (close_h1[1] - open_h1[1]) / (range_h1 + 1e-10);
+
+   // 8. ema50_ema200_h4: (ema50 - ema200) / close, bar index 2 (H4 shift + EMA lag)
+   double f08_ema50_ema200_h4 = (ema50_h4[2] - ema200_h4[2]) / (close_h4[2] + 1e-10);
+
+   // 9. atr_ratio_h4: atr / close, bar index 1
+   double f09_atr_ratio_h4 = atr_h4[1] / (close_h4[1] + 1e-10);
+
+   // 10. adx_h4: simplified ADX (NOT standard iADX), bar index 1
+   double f10_adx_h4 = ComputeSimplifiedADX(PERIOD_H4, 1);
+
+   // 11. squeeze_ratio_h4: BB_width / KC_width, bar index 1
+   double f11_squeeze_h4 = ComputeSqueezeRatio(PERIOD_H4, 1);
+
+   // 12. choppiness_h4: choppiness index, bar index 1
+   double f12_chop_h4 = ComputeChoppiness(PERIOD_H4, 1);
+   chop_h4_out = f12_chop_h4; // Output for regime filter
+
+   // 13. body_ratio_h4: (close - open) / (high - low), bar index 1
+   double range_h4 = high_h4[1] - low_h4[1];
+   double f13_body_ratio_h4 = (close_h4[1] - open_h4[1]) / (range_h4 + 1e-10);
+
+   // 14. range_pct_h4: (high - low) / close, bar index 1
+   double f14_range_pct_h4 = range_h4 / (close_h4[1] + 1e-10);
+
+   // Build JSON request with exactly 14 features
    string features = StringFormat(
-      "[%.6f,%.6f,%.4f,%.6f,%.8f,%.8f,%.8f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.6f,%.4f,%.6f,%.8f,%.4f,%.8f,%.8f]",
-      // H1 features (7): excluded adx_h1
-      close_ema50_h1, ema50_ema200_h1, rsi_val_h1, rsi_slope_h1,
-      atr_ratio_h1, body_h1, range_h1,
-      // Time features (9): hour + 3 sessions + 5 days
-      hour, session_asian, session_european, session_american,
-      dow_monday, dow_tuesday, dow_wednesday, dow_thursday, dow_friday,
-      // H4 features (7): excluded close_ema50_h4
-      ema50_ema200_h4, rsi_val_h4, rsi_slope_h4,
-      atr_ratio_h4, adx_val_h4, body_h4, range_h4
-      // Excluded: prev_return_h1, prev_return_h4
+      "[%.8f,%.8f,%.4f,%.8f,%.6f,%.4f,%.6f,%.8f,%.8f,%.8f,%.6f,%.4f,%.6f,%.8f]",
+      f01_close_ema50_h1,
+      f02_ema50_ema200_h1,
+      f03_rsi_h1,
+      f04_atr_ratio_h1,
+      f05_squeeze_h1,
+      f06_chop_h1,
+      f07_body_ratio_h1,
+      f08_ema50_ema200_h4,
+      f09_atr_ratio_h4,
+      f10_adx_h4,
+      f11_squeeze_h4,
+      f12_chop_h4,
+      f13_body_ratio_h4,
+      f14_range_pct_h4
    );
-   
+
    string json_request = "{\"features\":" + features + "}";
-   
+
+   Print("Features: ", features);
+
    // Make HTTP request
    uchar post_data[];
    uchar result_data[];
    string result_headers;
-   
+
    StringToCharArray(json_request, post_data, 0, StringLen(json_request));
-   
-   int timeout = 5000; // 5 seconds
+
+   int timeout = 5000;
    ResetLastError();
-   
+
    string headers = "Content-Type: application/json\r\n";
    int res = WebRequest(
       "POST",
@@ -349,12 +579,12 @@ int GetMLPrediction(double &confidence)
       result_data,
       result_headers
    );
-   
+
    if(res == -1)
    {
       int last_error = GetLastError();
       string error_desc = "";
-      
+
       switch(last_error)
       {
          case 4016: error_desc = "URL not allowed in WebRequest list"; break;
@@ -364,322 +594,247 @@ int GetMLPrediction(double &confidence)
          case 4062: error_desc = "Invalid URL"; break;
          default: error_desc = "Unknown error"; break;
       }
-      
+
       Print("WebRequest error ", last_error, ": ", error_desc);
       if(last_error == 4016 || last_error == 4018)
       {
-         Print("Please add URL to allowed list in: Tools->Options->Expert Advisors");
+         Print("Add URL to: Tools -> Options -> Expert Advisors");
          Print("Add: http://127.0.0.1, http://localhost");
       }
       return 0;
    }
-   
+
    string response = CharArrayToString(result_data);
-   Print("API Response: ", response);
-   
+
    // Extract prediction and confidence
    double sell_prob = ExtractValue(response, "sell");
    double range_prob = ExtractValue(response, "range");
    double buy_prob = ExtractValue(response, "buy");
    confidence = ExtractValue(response, "confidence");
-   
+
    string prediction = ExtractStringValue(response, "prediction");
-   
-   Print("ML Prediction: ", prediction, " (Confidence: ", DoubleToString(confidence*100, 1), "%)");
-   Print("  Sell: ", DoubleToString(sell_prob*100, 1), "% | Range: ", 
-         DoubleToString(range_prob*100, 1), "% | Buy: ", DoubleToString(buy_prob*100, 1), "%");
-   
-   if(confidence < ML_Confidence_Threshold)
-   {
-      Print("ML confidence too low, skipping trade");
-      return 0;
-   }
-   
-   if(prediction == "buy")
-      return 1;
-   else if(prediction == "sell")
+
+   Print("ML: ", prediction, " | Sell=", DoubleToString(sell_prob*100, 1),
+         "% Range=", DoubleToString(range_prob*100, 1),
+         "% Buy=", DoubleToString(buy_prob*100, 1),
+         "% | Conf=", DoubleToString(confidence*100, 1), "%");
+
+   // SELL-ONLY: only return sell signal
+   if(prediction == "sell" && confidence >= ML_Confidence_Threshold)
       return -1;
-   else
-      return 0;
+
+   if(confidence < ML_Confidence_Threshold)
+      Print("Confidence below threshold: ", DoubleToString(confidence*100, 1),
+            "% < ", DoubleToString(ML_Confidence_Threshold*100, 1), "%");
+   else if(prediction != "sell")
+      Print("Non-sell prediction ignored: ", prediction);
+
+   return 0;
 }
 
 //+------------------------------------------------------------------+
-//| Get combined trade signal (ML + Technical)                       |
+//| Get trade signal with regime filter and ML/Technical confluence  |
 //+------------------------------------------------------------------+
 int GetTradeSignal()
 {
-   // Apply filters
+   // Time filter
    if(UseTimeFilter && !IsWithinTradingHours())
       return 0;
-   
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(handleATR, 0, 0, 1, atr) <= 0)
-      return 0;
-   
-   if(UseVolatilityFilter && atr[0] < MinATR)
-      return 0;
-   
-   // Get ML prediction
+
+   // Get technical signal (always needed)
+   int tech_signal = GetTechnicalSignal();
+
+   // ─── TECHNICAL ONLY MODE ───
+   if(TechnicalOnly)
+   {
+      if(tech_signal != -1)
+         return 0;
+
+      Print(">>> Technical SELL signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI bearish");
+      return -1;
+   }
+
+   // ─── ML MODES (ML-only or ML+Technical) ───
    double ml_confidence = 0;
-   int ml_signal = GetMLPrediction(ml_confidence);
-   
-   // If not using ML at all, get technical signal
-   if(!UseMLPredictions)
-      return GetTechnicalSignal();
-   
-   // If using ML only (no technical combination)
+   double chop_h1 = 50.0, chop_h4 = 50.0;
+   int ml_signal = GetMLPrediction(ml_confidence, chop_h1, chop_h4);
+
+   // Combine logic
    if(!CombineWithTechnical)
    {
-      if(ml_signal != 0 && ml_confidence >= ML_Confidence_Threshold)
-      {
-         Print("✓ ML signal only: ", ml_signal == 1 ? "BUY" : "SELL", " (Confidence: ", DoubleToString(ml_confidence*100, 1), "%)");
-         return ml_signal;
-      }
-      else
-      {
-         if(ml_signal == 0)
-            Print("ML returned no signal");
-         else if(ml_confidence < ML_Confidence_Threshold)
-            Print("ML confidence too low: ", DoubleToString(ml_confidence*100, 1), "% < ", DoubleToString(ML_Confidence_Threshold*100, 1), "%");
+      // ML-only mode (original behavior)
+      if(ml_signal == 0)
          return 0;
-      }
-   }
-   
-   // If combining ML with technical (CombineWithTechnical = true)
-   if(CombineWithTechnical)
-   {
-      int tech_signal = GetTechnicalSignal();
-      
-      if(ml_signal == tech_signal && ml_signal != 0 && ml_confidence >= ML_Confidence_Threshold)
-      {
-         Print("✓ ML and Technical signals agree: ", ml_signal == 1 ? "BUY" : "SELL");
-         return ml_signal;
-      }
-      else if(tech_signal != 0 && ml_confidence < ML_Confidence_Threshold)
-      {
-         Print("✗ ML confidence too low, using technical signal: ", tech_signal == 1 ? "BUY" : "SELL");
-         return tech_signal;
-      }
-      else
-      {
-         Print("✗ ML and Technical signals disagree - no trade");
-         Print("  ML: ", ml_signal == 1 ? "BUY" : (ml_signal == -1 ? "SELL" : "NONE"), 
-               " (Confidence: ", DoubleToString(ml_confidence*100, 1), "%)");
-         Print("  Technical: ", tech_signal == 1 ? "BUY" : (tech_signal == -1 ? "SELL" : "NONE"));
-         return 0;
-      }
-   }
-   
-   return 0;
-}
-
-//+------------------------------------------------------------------+
-//| Get technical signal (original strategy)                         |
-//+------------------------------------------------------------------+
-int GetTechnicalSignal()
-{
-   double maFast[], maSlow[], rsi[], trendMA[];
-   ArraySetAsSeries(maFast, true);
-   ArraySetAsSeries(maSlow, true);
-   ArraySetAsSeries(rsi, true);
-   ArraySetAsSeries(trendMA, true);
-   
-   if(CopyBuffer(handleMA_Fast, 0, 0, 3, maFast) < 3 ||
-      CopyBuffer(handleMA_Slow, 0, 0, 3, maSlow) < 3 ||
-      CopyBuffer(handleRSI, 0, 0, 1, rsi) < 1 ||
-      CopyBuffer(handleTrendMA, 0, 0, 1, trendMA) < 1)
-      return 0;
-   
-   double close = iClose(_Symbol, _Period, 1);
-   
-   bool upTrend = close > trendMA[0];
-   bool downTrend = close < trendMA[0];
-   
-   bool bullishCross = (maFast[1] > maSlow[1] && maFast[2] <= maSlow[2]);
-   bool bearishCross = (maFast[1] < maSlow[1] && maFast[2] >= maSlow[2]);
-   
-   bool rsiBullish = rsi[0] > 50 && rsi[0] < RSI_Overbought;
-   bool rsiBearish = rsi[0] < 50 && rsi[0] > RSI_Oversold;
-   
-   if(bullishCross && rsiBullish)
-   {
-      if(!UseTrendFilter || upTrend)
-         return 1;
-   }
-   
-   if(bearishCross && rsiBearish)
-   {
-      if(!UseTrendFilter || downTrend)
-         return -1;
-   }
-   
-   return 0;
-}
-
-//+------------------------------------------------------------------+
-//| Extract numeric value from JSON string                           |
-//+------------------------------------------------------------------+
-double ExtractValue(const string json, const string key)
-{
-   string search = "\"" + key + "\":";
-   int start = StringFind(json, search);
-   if(start == -1) 
-   {
-      // Try alternative format
-      search = "'" + key + "':";
-      start = StringFind(json, search);
-      if(start == -1) return 0.0;
-   }
-   
-   start += StringLen(search);
-   int end = start;
-   
-   while(end < StringLen(json))
-   {
-      string ch = StringSubstr(json, end, 1);
-      if(ch == "," || ch == "}")
-         break;
-      end++;
-   }
-   
-   string value_str = StringSubstr(json, start, end - start);
-   value_str = StringTrimCustom(value_str);
-   return StringToDoubleCustom(value_str);
-}
-
-//+------------------------------------------------------------------+
-//| Extract string value from JSON                                   |
-//+------------------------------------------------------------------+
-string ExtractStringValue(const string json, const string key)
-{
-   string search = "\"" + key + "\":\"";
-   int start = StringFind(json, search);
-   if(start == -1) 
-   {
-      // Try alternative format
-      search = "'" + key + "':'";
-      start = StringFind(json, search);
-      if(start == -1) return "";
-   }
-   
-   start += StringLen(search);
-   int end = StringFind(json, "\"", start);
-   
-   if(end == -1)
-   {
-      // Try single quotes
-      end = StringFind(json, "'", start);
-   }
-   
-   if(end == -1 || end <= start)
-      return "";
-   
-   return StringSubstr(json, start, end - start);
-}
-
-//+------------------------------------------------------------------+
-//| Custom string trim function                                      |
-//+------------------------------------------------------------------+
-string StringTrimCustom(const string str)
-{
-   string result = str;
-   
-   // Trim leading spaces
-   while(StringSubstr(result, 0, 1) == " ")
-      result = StringSubstr(result, 1);
-   
-   // Trim trailing spaces
-   while(StringSubstr(result, StringLen(result)-1, 1) == " ")
-      result = StringSubstr(result, 0, StringLen(result)-1);
-   
-   return result;
-}
-
-//+------------------------------------------------------------------+
-//| Custom string to double conversion                               |
-//+------------------------------------------------------------------+
-double StringToDoubleCustom(const string value)
-{
-   // Remove any non-numeric characters except decimal point and minus
-   string clean_value = "";
-   for(int i = 0; i < StringLen(value); i++)
-   {
-      string ch = StringSubstr(value, i, 1);
-      if((ch >= "0" && ch <= "9") || ch == "." || ch == "-")
-         clean_value += ch;
-   }
-   
-   if(clean_value == "" || clean_value == "-")
-      return 0.0;
-   
-   // Use MQL5's built-in conversion
-   return ::StringToDouble(clean_value);
-}
-
-//+------------------------------------------------------------------+
-//| Open a new trade with dynamic risk management                    |
-//+------------------------------------------------------------------+
-void OpenTrade(ENUM_ORDER_TYPE orderType)
-{
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(handleATR, 0, 0, 1, atr) <= 0)
-   {
-      Print("Failed to get ATR for position sizing");
-      return;
-   }
-   
-   double price = (orderType == ORDER_TYPE_BUY) ?
-                  SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
-                  SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double slDistance = atr[0] * ATR_Multiplier;
-   double tpDistance = atr[0] * ATR_Multiplier * 2.0;
-   
-   double sl = (orderType == ORDER_TYPE_BUY) ? price - slDistance : price + slDistance;
-   double tp = (orderType == ORDER_TYPE_BUY) ? price + tpDistance : price - tpDistance;
-   
-   sl = NormalizeDouble(sl, _Digits);
-   tp = NormalizeDouble(tp, _Digits);
-   
-   double lotSize = CalculateLotSize(MathAbs(price - sl));
-   
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   if(lotSize < minLot)
-   {
-      Print("Calculated lot size too small: ", lotSize, ", minimum: ", minLot);
-      lotSize = minLot;
-   }
-   
-   string comment = UseMLPredictions ? "ML-Enhanced EA " : "Advanced EA ";
-   comment += (orderType == ORDER_TYPE_BUY) ? "Buy" : "Sell";
-   
-   if(orderType == ORDER_TYPE_BUY)
-   {
-      if(trade.Buy(lotSize, _Symbol, price, sl, tp, comment))
-      {
-         Print("BUY order opened: Lot=", lotSize, " Price=", price, " SL=", sl, " TP=", tp);
-         totalTradesToday++;
-      }
-      else
-      {
-         Print("Failed to open BUY order: ", trade.ResultRetcodeDescription());
-      }
    }
    else
    {
-      if(trade.Sell(lotSize, _Symbol, price, sl, tp, comment))
+      // Combined mode: Technical generates signal, ML confirms or fills gap
+      if(tech_signal == -1)
       {
-         Print("SELL order opened: Lot=", lotSize, " Price=", price, " SL=", sl, " TP=", tp);
-         totalTradesToday++;
+         // Technical says SELL
+         if(ml_signal == -1 && ml_confidence >= ML_Confidence_Threshold)
+         {
+            // Both agree - strongest signal
+            Print("✓ ML + Technical AGREE: SELL");
+         }
+         else if(ml_confidence < ML_Confidence_Threshold)
+         {
+            // Technical strong, ML weak - use technical
+            Print("✓ Technical SELL (ML weak: ", DoubleToString(ml_confidence*100, 1), "%)");
+         }
+         else
+         {
+            // Technical SELL but ML disagrees
+            Print("✗ Technical SELL but ML says no");
+            return 0;
+         }
+      }
+      else if(ml_signal == -1 && ml_confidence >= ML_Confidence_Threshold)
+      {
+         // ML SELL but no technical - still go (ML-only signal)
+         Print("✓ ML SELL (Technical no signal)");
       }
       else
       {
-         Print("Failed to open SELL order: ", trade.ResultRetcodeDescription());
+         // No valid signal
+         return 0;
       }
    }
+
+   // Regime filter: only trade when both timeframes are trending (low choppiness)
+   if(UseRegimeFilter && ml_signal != 0)
+   {
+      double median_h1 = ComputeRollingMedian(PERIOD_H1, 1, RegimeLookback);
+      double median_h4 = ComputeRollingMedian(PERIOD_H4, 1, MathMin(RegimeLookback / 4, 125));
+
+      bool h1_trending = (chop_h1 < median_h1);
+      bool h4_trending = (chop_h4 < median_h4);
+
+      if(!h1_trending || !h4_trending)
+      {
+         Print("Regime filter blocked: chop_h1=", DoubleToString(chop_h1, 1),
+               " (med=", DoubleToString(median_h1, 1), ") | chop_h4=",
+               DoubleToString(chop_h4, 1), " (med=", DoubleToString(median_h4, 1), ")");
+         return 0;
+      }
+
+      Print("Regime OK: chop_h1=", DoubleToString(chop_h1, 1),
+            " < ", DoubleToString(median_h1, 1),
+            " | chop_h4=", DoubleToString(chop_h4, 1),
+            " < ", DoubleToString(median_h4, 1));
+   }
+
+   return -1; // SELL signal
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL trade with fixed TP/SL                                 |
+//+------------------------------------------------------------------+
+void OpenSellTrade()
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   // Fixed TP/SL in pips (1 pip = 10 points for 5-digit broker)
+   double slDistance = SL_Pips * point * 10;
+   double tpDistance = TP_Pips * point * 10;
+
+   double sl = NormalizeDouble(price + slDistance, _Digits);
+   double tp = NormalizeDouble(price - tpDistance, _Digits);
+
+   double lotSize = CalculateLotSize(slDistance);
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(lotSize < minLot)
+   {
+      Print("Lot size too small: ", DoubleToString(lotSize, 4), ", using minimum: ", DoubleToString(minLot, 2));
+      lotSize = minLot;
+   }
+
+   string comment = "ML Sell TP=" + DoubleToString(TP_Pips, 0) + "/SL=" + DoubleToString(SL_Pips, 0);
+
+   if(trade.Sell(lotSize, _Symbol, price, sl, tp, comment))
+   {
+      Print("SELL opened: Lot=", DoubleToString(lotSize, 2),
+            " Price=", DoubleToString(price, _Digits),
+            " SL=", DoubleToString(sl, _Digits),
+            " TP=", DoubleToString(tp, _Digits));
+      totalTradesToday++;
+   }
+   else
+   {
+      Print("Failed to open SELL: ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for closed trades and update circuit breaker               |
+//+------------------------------------------------------------------+
+void CheckClosedTrades()
+{
+   int currentPositions = CountOpenPositions();
+
+   // A position was closed
+   if(currentPositions < cb_last_position_count)
+   {
+      // Check recent deal history
+      datetime from = TimeCurrent() - 3600; // Last hour
+      HistorySelect(from, TimeCurrent());
+
+      int totalDeals = HistoryDealsTotal();
+      for(int i = totalDeals - 1; i >= 0; i--)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket == 0) continue;
+
+         long magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+         string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+         long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+
+         if(magic != 123456 || symbol != _Symbol || entry != DEAL_ENTRY_OUT)
+            continue;
+
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         double commission = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+         double swap = HistoryDealGetDouble(ticket, DEAL_SWAP);
+         double netProfit = profit + commission + swap;
+
+         // Update circuit breaker state
+         cb_running_pnl += netProfit;
+         cb_peak_pnl = MathMax(cb_peak_pnl, cb_running_pnl);
+         double dd_pips = (cb_peak_pnl - cb_running_pnl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+         if(netProfit <= 0)
+         {
+            cb_consecutive_losses++;
+            Print("CB: Loss #", cb_consecutive_losses, " | Net PnL: $",
+                  DoubleToString(cb_running_pnl, 2), " | DD: ", DoubleToString(dd_pips, 1), " pips");
+         }
+         else
+         {
+            if(CB_ResetOnWin)
+               cb_consecutive_losses = 0;
+            Print("CB: Win | Streak reset | Net PnL: $", DoubleToString(cb_running_pnl, 2));
+         }
+
+         // Check triggers
+         if(cb_consecutive_losses >= CB_MaxConsecLosses || dd_pips >= CB_MaxDrawdownPips)
+         {
+            cb_paused_until_bar = cb_bar_counter + CB_CooldownBars;
+            cb_triggers++;
+            cb_consecutive_losses = 0;
+
+            Print("*** CIRCUIT BREAKER TRIGGERED ***");
+            Print("Pausing for ", CB_CooldownBars, " bars (until bar ", cb_paused_until_bar, ")");
+            Print("Reason: ", (cb_consecutive_losses >= CB_MaxConsecLosses) ?
+                  "consecutive losses" : "drawdown exceeded");
+         }
+
+         break; // Process only the most recent exit deal
+      }
+   }
+
+   cb_last_position_count = currentPositions;
 }
 
 //+------------------------------------------------------------------+
@@ -691,43 +846,38 @@ double CalculateLotSize(double slDistance)
    double riskAmount = balance * RiskPercent / 100.0;
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
-   if(tickValue <= 0 || tickSize <= 0 || point <= 0)
+
+   if(tickValue <= 0 || tickSize <= 0 || slDistance <= 0)
    {
       Print("Error getting symbol info for lot calculation");
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
-   
+
    double lotSize = riskAmount / (slDistance / tickSize * tickValue);
-   
+
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
+
    lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
-   
    lotSize = NormalizeDouble(lotSize, 2);
-   
-   // Safety check for margin
+
+   // Margin safety check
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   double marginRequired = 0.0;
-   
-   // Calculate approximate margin required for this lot size
    double margin_per_lot = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
-   if(margin_per_lot > 0)
-      marginRequired = lotSize * margin_per_lot;
-   
-   // Use max 50% of free margin
-   if(marginRequired > freeMargin * 0.5 && freeMargin > 0)
+   if(margin_per_lot > 0 && freeMargin > 0)
    {
-      Print("Reducing lot size due to margin constraints");
-      lotSize = MathMin(lotSize, freeMargin * 0.5 / marginRequired * lotSize);
-      lotSize = MathFloor(lotSize / lotStep) * lotStep;
-      lotSize = NormalizeDouble(lotSize, 2);
+      double marginRequired = lotSize * margin_per_lot;
+      if(marginRequired > freeMargin * 0.5)
+      {
+         Print("Reducing lot size due to margin constraints");
+         lotSize = MathMin(lotSize, freeMargin * 0.5 / margin_per_lot);
+         lotSize = MathFloor(lotSize / lotStep) * lotStep;
+         lotSize = NormalizeDouble(lotSize, 2);
+      }
    }
-   
+
    return lotSize;
 }
 
@@ -742,52 +892,55 @@ void ManagePositions()
       {
          if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
             continue;
-         
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         
+
          double openPrice = posInfo.PriceOpen();
          double sl = posInfo.StopLoss();
-         double profitPips = 0;
-         
+
          double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         double profitPips = 0;
          if(point > 0)
          {
             if(posInfo.PositionType() == POSITION_TYPE_BUY)
-               profitPips = (currentPrice - openPrice) / (point * 10); // Convert to pips (10 points per pip for 5-digit brokers)
+               profitPips = (currentPrice - openPrice) / (point * 10);
             else
                profitPips = (openPrice - currentPrice) / (point * 10);
          }
-         
+
+         // Breakeven
          if(UseBreakeven && profitPips >= BreakevenTriggerPips && sl != 0)
          {
             double newSL = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                            openPrice + BreakevenOffsetPips * point * 10 :
                            openPrice - BreakevenOffsetPips * point * 10;
-            
+
             newSL = NormalizeDouble(newSL, _Digits);
-            
+
             if((posInfo.PositionType() == POSITION_TYPE_BUY && newSL > sl) ||
-               (posInfo.PositionType() == POSITION_TYPE_SELL && newSL < sl))
+               (posInfo.PositionType() == POSITION_TYPE_SELL && (newSL < sl || sl == 0)))
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Position ", ticket, " moved to breakeven+", BreakevenOffsetPips, " pips");
+                  Print("Position ", ticket, " moved to breakeven+", DoubleToString(BreakevenOffsetPips, 0), " pips");
             }
          }
-         
+
+         // Partial close
          if(UsePartialClose && profitPips >= BreakevenTriggerPips * 2)
          {
             double closeVolume = posInfo.Volume() * PartialClosePercent / 100.0;
             double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
             closeVolume = MathMax(closeVolume, minLot);
             closeVolume = NormalizeDouble(closeVolume, 2);
-            
+
             if(closeVolume >= minLot && closeVolume < posInfo.Volume())
             {
                if(trade.PositionClosePartial(ticket, closeVolume))
-                  Print("Partial close: ", PartialClosePercent, "% of position ", ticket, " at profit");
+                  Print("Partial close: ", DoubleToString(PartialClosePercent, 0),
+                        "% of position ", ticket);
             }
          }
       }
@@ -800,41 +953,39 @@ void ManagePositions()
 void ManageTrailingStops()
 {
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
       {
          if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
             continue;
-         
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         
+
          double sl = posInfo.StopLoss();
-         double trailDistance = TrailingStopPips * point * 10; // Convert pips to price
+         double trailDistance = TrailingStopPips * point * 10;
          double trailStep = TrailingStepPips * point * 10;
-         
+
          if(posInfo.PositionType() == POSITION_TYPE_BUY && sl > 0)
          {
-            double newSL = currentPrice - trailDistance;
-            newSL = NormalizeDouble(newSL, _Digits);
+            double newSL = NormalizeDouble(currentPrice - trailDistance, _Digits);
             if(newSL > sl + trailStep)
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Trailing stop updated for BUY position ", ticket);
+                  Print("Trailing stop updated for BUY ", ticket);
             }
          }
          else if(posInfo.PositionType() == POSITION_TYPE_SELL && sl > 0)
          {
-            double newSL = currentPrice + trailDistance;
-            newSL = NormalizeDouble(newSL, _Digits);
+            double newSL = NormalizeDouble(currentPrice + trailDistance, _Digits);
             if(newSL < sl - trailStep)
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Trailing stop updated for SELL position ", ticket);
+                  Print("Trailing stop updated for SELL ", ticket);
             }
          }
       }
@@ -842,65 +993,152 @@ void ManageTrailingStops()
 }
 
 //+------------------------------------------------------------------+
-//| Check daily limits (max loss/profit)                             |
+//| Extract numeric value from JSON string                           |
+//+------------------------------------------------------------------+
+double ExtractValue(const string json, const string key)
+{
+   string search = "\"" + key + "\":";
+   int start = StringFind(json, search);
+   if(start == -1)
+   {
+      search = "'" + key + "':";
+      start = StringFind(json, search);
+      if(start == -1) return 0.0;
+   }
+
+   start += StringLen(search);
+   int end = start;
+
+   while(end < StringLen(json))
+   {
+      string ch = StringSubstr(json, end, 1);
+      if(ch == "," || ch == "}")
+         break;
+      end++;
+   }
+
+   string value_str = StringSubstr(json, start, end - start);
+   value_str = StringTrimCustom(value_str);
+   return StringToDoubleCustom(value_str);
+}
+
+//+------------------------------------------------------------------+
+//| Extract string value from JSON                                   |
+//+------------------------------------------------------------------+
+string ExtractStringValue(const string json, const string key)
+{
+   string search = "\"" + key + "\":\"";
+   int start = StringFind(json, search);
+   if(start == -1)
+   {
+      search = "'" + key + "':'";
+      start = StringFind(json, search);
+      if(start == -1) return "";
+   }
+
+   start += StringLen(search);
+   int end = StringFind(json, "\"", start);
+
+   if(end == -1)
+      end = StringFind(json, "'", start);
+
+   if(end == -1 || end <= start)
+      return "";
+
+   return StringSubstr(json, start, end - start);
+}
+
+//+------------------------------------------------------------------+
+//| Custom string trim                                               |
+//+------------------------------------------------------------------+
+string StringTrimCustom(const string str)
+{
+   string result = str;
+   while(StringLen(result) > 0 && StringSubstr(result, 0, 1) == " ")
+      result = StringSubstr(result, 1);
+   while(StringLen(result) > 0 && StringSubstr(result, StringLen(result)-1, 1) == " ")
+      result = StringSubstr(result, 0, StringLen(result)-1);
+   return result;
+}
+
+//+------------------------------------------------------------------+
+//| Custom string to double                                          |
+//+------------------------------------------------------------------+
+double StringToDoubleCustom(const string value)
+{
+   string clean_value = "";
+   for(int i = 0; i < StringLen(value); i++)
+   {
+      string ch = StringSubstr(value, i, 1);
+      if((ch >= "0" && ch <= "9") || ch == "." || ch == "-")
+         clean_value += ch;
+   }
+
+   if(clean_value == "" || clean_value == "-")
+      return 0.0;
+
+   return ::StringToDouble(clean_value);
+}
+
+//+------------------------------------------------------------------+
+//| Check daily limits                                               |
 //+------------------------------------------------------------------+
 bool CheckDailyLimits()
 {
    double currentBalance = accInfo.Balance();
    dailyProfitLoss = currentBalance - dailyStartBalance;
    double dailyPL_Percent = 0;
-   
+
    if(dailyStartBalance > 0)
       dailyPL_Percent = (dailyProfitLoss / dailyStartBalance) * 100.0;
-   
+
    if(dailyPL_Percent <= -MaxDailyLoss)
    {
-      Print("Daily loss limit reached: ", dailyPL_Percent, "%");
+      Print("Daily loss limit reached: ", DoubleToString(dailyPL_Percent, 1), "%");
       return false;
    }
-   
+
    if(dailyPL_Percent >= MaxDailyProfit)
    {
-      Print("Daily profit target reached: ", dailyPL_Percent, "%");
+      Print("Daily profit target reached: ", DoubleToString(dailyPL_Percent, 1), "%");
       return false;
    }
-   
+
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Check if new day started and reset counters                      |
+//| Daily reset                                                      |
 //+------------------------------------------------------------------+
 void CheckDailyReset()
 {
    MqlDateTime currentTime;
    TimeToStruct(TimeCurrent(), currentTime);
-   
+
    static int lastDay = -1;
-   
+
    if(lastDay == -1)
       lastDay = currentTime.day;
-   
+
    if(currentTime.day != lastDay)
    {
       dailyStartBalance = accInfo.Balance();
       totalTradesToday = 0;
       dailyProfitLoss = 0.0;
       lastDay = currentTime.day;
-      
+
       Print("=== New Trading Day ===");
-      Print("Starting balance: $", dailyStartBalance);
+      Print("Balance: $", DoubleToString(dailyStartBalance, 2));
    }
 }
 
 //+------------------------------------------------------------------+
-//| Check if within trading hours                                    |
+//| Check trading hours                                              |
 //+------------------------------------------------------------------+
 bool IsWithinTradingHours()
 {
    MqlDateTime currentTime;
    TimeToStruct(TimeCurrent(), currentTime);
-   
    return (currentTime.hour >= StartHour && currentTime.hour < EndHour);
 }
 
@@ -925,7 +1163,7 @@ int CountOpenPositions()
 void CloseAllPositions(string reason)
 {
    Print("Closing all positions: ", reason);
-   
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
