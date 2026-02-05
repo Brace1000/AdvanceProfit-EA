@@ -19,7 +19,7 @@ input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
 input double MaxDailyLoss = 3.0;             // Max daily loss (% of balance)
 input double MaxDailyProfit = 5.0;           // Daily profit target (%)
-input int    MaxSimultaneousTrades = 1;      // Maximum open positions
+input int    MaxSimultaneousTrades = 2;      // Maximum open positions (2 for twin trades)
 input double TP_Pips = 20.0;                // Take Profit (pips) - fixed barrier
 input double SL_Pips = 15.0;                // Stop Loss (pips) - fixed barrier
 
@@ -50,14 +50,23 @@ input double CB_MaxDrawdownPips = 100.0;     // Max drawdown (pips) before pause
 input int    CB_CooldownBars = 48;           // Bars to pause after trigger
 input bool   CB_ResetOnWin = true;           // Reset loss counter on win
 
-input group "=== Position Management ==="
+input group "=== Twin Trade System ==="
+input bool   UseTwinTrades = true;           // Enable twin trade system
+input double TwinA_TP_Pips = 10.0;           // Trade A (Banker): Take Profit pips
+input double TwinB_TP_Pips = 20.0;           // Trade B (Runner): Take Profit pips
+input double TwinB_BE_Trigger = 10.0;        // Trade B: Breakeven trigger pips
+input double TwinB_BE_Offset = 2.0;          // Trade B: Lock in pips at breakeven
+input double TwinB_Trail_Pips = 8.0;         // Trade B: Trailing stop distance
+input double TwinB_Trail_Step = 2.0;         // Trade B: Trailing step size
+
+input group "=== Position Management (Single Trade) ==="
 input bool   UseTrailingStop = true;         // Enable trailing stop
-input double TrailingStopPips = 30;          // Trailing stop distance (pips)
-input double TrailingStepPips = 10;          // Trailing step (pips)
+input double TrailingStopPips = 8;           // Trailing stop distance (pips)
+input double TrailingStepPips = 2;           // Trailing step (pips)
 input bool   UseBreakeven = true;            // Move SL to breakeven
-input double BreakevenTriggerPips = 20;      // Pips profit to trigger BE
-input double BreakevenOffsetPips = 5;        // BE offset (pips)
-input bool   UsePartialClose = true;         // Partial close at targets
+input double BreakevenTriggerPips = 10;      // Pips profit to trigger BE
+input double BreakevenOffsetPips = 2;        // BE offset (lock in pips)
+input bool   UsePartialClose = false;        // Partial close (disabled for twin)
 input double PartialClosePercent = 50.0;     // % to close at first target
 
 // Global Variables
@@ -152,6 +161,11 @@ int OnInit()
       Print("Confidence Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
    }
    Print("TP: ", TP_Pips, " pips | SL: ", SL_Pips, " pips");
+   if(UseTwinTrades)
+      Print("Twin Trades: ON | A(Banker)=", TwinA_TP_Pips, "p | B(Runner)=", TwinB_TP_Pips,
+            "p BE@", TwinB_BE_Trigger, " Trail@", TwinB_Trail_Pips);
+   else
+      Print("Twin Trades: OFF (single trade mode)");
    Print("Technical: MA(", MA_Fast, ",", MA_Slow, ") + RSI(", RSI_Period, ") + Trend(", TrendMA_Period, ")");
    Print("Regime Filter: ", UseRegimeFilter ? "ON" : "OFF");
    Print("Circuit Breaker: ", CB_Enabled ? "ON" : "OFF");
@@ -511,7 +525,9 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 
    // 7. body_ratio_h1: (close - open) / (high - low), bar index 1
    double range_h1 = high_h1[1] - low_h1[1];
-   double f07_body_ratio_h1 = (close_h1[1] - open_h1[1]) / (range_h1 + 1e-10);
+   double f07_body_ratio_h1 = (range_h1 > 1e-8)
+      ? MathMax(-1.0, MathMin(1.0, (close_h1[1] - open_h1[1]) / range_h1))
+      : 0.0;  // Doji candle (no range)
 
    // 8. ema50_ema200_h4: (ema50 - ema200) / close, bar index 2 (H4 shift + EMA lag)
    double f08_ema50_ema200_h4 = (ema50_h4[2] - ema200_h4[2]) / (close_h4[2] + 1e-10);
@@ -531,7 +547,9 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 
    // 13. body_ratio_h4: (close - open) / (high - low), bar index 1
    double range_h4 = high_h4[1] - low_h4[1];
-   double f13_body_ratio_h4 = (close_h4[1] - open_h4[1]) / (range_h4 + 1e-10);
+   double f13_body_ratio_h4 = (range_h4 > 1e-8)
+      ? MathMax(-1.0, MathMin(1.0, (close_h4[1] - open_h4[1]) / range_h4))
+      : 0.0;  // Doji candle (no range)
 
    // 14. range_pct_h4: (high - low) / close, bar index 1
    double f14_range_pct_h4 = range_h4 / (close_h4[1] + 1e-10);
@@ -734,36 +752,80 @@ void OpenSellTrade()
 {
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pipSize = point * 10;  // 1 pip = 10 points for 5-digit broker
 
-   // Fixed TP/SL in pips (1 pip = 10 points for 5-digit broker)
-   double slDistance = SL_Pips * point * 10;
-   double tpDistance = TP_Pips * point * 10;
-
+   double slDistance = SL_Pips * pipSize;
    double sl = NormalizeDouble(price + slDistance, _Digits);
-   double tp = NormalizeDouble(price - tpDistance, _Digits);
 
-   double lotSize = CalculateLotSize(slDistance);
-
+   // Calculate total lot size based on risk
+   double totalLotSize = CalculateLotSize(slDistance);
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   if(lotSize < minLot)
-   {
-      Print("Lot size too small: ", DoubleToString(lotSize, 4), ", using minimum: ", DoubleToString(minLot, 2));
-      lotSize = minLot;
-   }
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   string comment = "ML Sell TP=" + DoubleToString(TP_Pips, 0) + "/SL=" + DoubleToString(SL_Pips, 0);
-
-   if(trade.Sell(lotSize, _Symbol, price, sl, tp, comment))
+   if(UseTwinTrades)
    {
-      Print("SELL opened: Lot=", DoubleToString(lotSize, 2),
-            " Price=", DoubleToString(price, _Digits),
-            " SL=", DoubleToString(sl, _Digits),
-            " TP=", DoubleToString(tp, _Digits));
-      totalTradesToday++;
+      // ═══ TWIN TRADE SYSTEM ═══
+      // Split lot size in half for each trade
+      double halfLot = MathFloor((totalLotSize / 2.0) / lotStep) * lotStep;
+      if(halfLot < minLot) halfLot = minLot;
+
+      // Trade A: The Banker (quick TP, no trailing)
+      double tpA = NormalizeDouble(price - TwinA_TP_Pips * pipSize, _Digits);
+      string commentA = "TwinA TP=" + DoubleToString(TwinA_TP_Pips, 0);
+
+      if(trade.Sell(halfLot, _Symbol, price, sl, tpA, commentA))
+      {
+         Print("TWIN-A (Banker) opened: Lot=", DoubleToString(halfLot, 2),
+               " TP=", DoubleToString(TwinA_TP_Pips, 0), " pips");
+      }
+      else
+      {
+         Print("Failed to open TWIN-A: ", trade.ResultRetcodeDescription());
+      }
+
+      // Trade B: The Runner (full TP, with BE + trailing)
+      double tpB = NormalizeDouble(price - TwinB_TP_Pips * pipSize, _Digits);
+      string commentB = "TwinB TP=" + DoubleToString(TwinB_TP_Pips, 0);
+
+      if(trade.Sell(halfLot, _Symbol, price, sl, tpB, commentB))
+      {
+         Print("TWIN-B (Runner) opened: Lot=", DoubleToString(halfLot, 2),
+               " TP=", DoubleToString(TwinB_TP_Pips, 0), " pips (BE@",
+               DoubleToString(TwinB_BE_Trigger, 0), ", Trail@",
+               DoubleToString(TwinB_Trail_Pips, 0), ")");
+         totalTradesToday++;
+      }
+      else
+      {
+         Print("Failed to open TWIN-B: ", trade.ResultRetcodeDescription());
+      }
    }
    else
    {
-      Print("Failed to open SELL: ", trade.ResultRetcodeDescription());
+      // ═══ SINGLE TRADE (original behavior) ═══
+      double tpDistance = TP_Pips * pipSize;
+      double tp = NormalizeDouble(price - tpDistance, _Digits);
+
+      if(totalLotSize < minLot)
+      {
+         Print("Lot size too small: ", DoubleToString(totalLotSize, 4), ", using minimum: ", DoubleToString(minLot, 2));
+         totalLotSize = minLot;
+      }
+
+      string comment = "ML Sell TP=" + DoubleToString(TP_Pips, 0) + "/SL=" + DoubleToString(SL_Pips, 0);
+
+      if(trade.Sell(totalLotSize, _Symbol, price, sl, tp, comment))
+      {
+         Print("SELL opened: Lot=", DoubleToString(totalLotSize, 2),
+               " Price=", DoubleToString(price, _Digits),
+               " SL=", DoubleToString(sl, _Digits),
+               " TP=", DoubleToString(tp, _Digits));
+         totalTradesToday++;
+      }
+      else
+      {
+         Print("Failed to open SELL: ", trade.ResultRetcodeDescription());
+      }
    }
 }
 
@@ -800,21 +862,33 @@ void CheckClosedTrades()
          double netProfit = profit + commission + swap;
 
          // Update circuit breaker state
-         cb_running_pnl += netProfit;
+         // Convert dollar P&L to pips: profit / (lots * pip_value_per_lot)
+         double lots = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+         double pip_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10; // 1 pip in price
+         double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+         double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+         double pnl_pips = (tick_size > 0 && tick_value > 0 && lots > 0)
+            ? netProfit / (lots * tick_value / tick_size * pip_point)
+            : 0.0;
+
+         cb_running_pnl += pnl_pips;
          cb_peak_pnl = MathMax(cb_peak_pnl, cb_running_pnl);
-         double dd_pips = (cb_peak_pnl - cb_running_pnl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+         double dd_pips = cb_peak_pnl - cb_running_pnl;
 
          if(netProfit <= 0)
          {
             cb_consecutive_losses++;
-            Print("CB: Loss #", cb_consecutive_losses, " | Net PnL: $",
-                  DoubleToString(cb_running_pnl, 2), " | DD: ", DoubleToString(dd_pips, 1), " pips");
+            Print("CB: Loss #", cb_consecutive_losses, " ",
+                  DoubleToString(pnl_pips, 1), " pips | Cumulative: ",
+                  DoubleToString(cb_running_pnl, 1), " pips | DD: ",
+                  DoubleToString(dd_pips, 1), " pips");
          }
          else
          {
             if(CB_ResetOnWin)
                cb_consecutive_losses = 0;
-            Print("CB: Win | Streak reset | Net PnL: $", DoubleToString(cb_running_pnl, 2));
+            Print("CB: Win +", DoubleToString(pnl_pips, 1), " pips | Streak reset | Cumulative: ",
+                  DoubleToString(cb_running_pnl, 1), " pips");
          }
 
          // Check triggers
@@ -893,6 +967,14 @@ void ManagePositions()
          if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
             continue;
 
+         string comment = posInfo.Comment();
+         bool isTwinA = (StringFind(comment, "TwinA") >= 0);
+         bool isTwinB = (StringFind(comment, "TwinB") >= 0);
+
+         // TwinA positions: NO breakeven or trailing - just let them run to TP/SL
+         if(isTwinA)
+            continue;
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
@@ -911,12 +993,16 @@ void ManagePositions()
                profitPips = (openPrice - currentPrice) / (point * 10);
          }
 
+         // Determine which parameters to use
+         double beTrigger = isTwinB ? TwinB_BE_Trigger : BreakevenTriggerPips;
+         double beOffset = isTwinB ? TwinB_BE_Offset : BreakevenOffsetPips;
+
          // Breakeven
-         if(UseBreakeven && profitPips >= BreakevenTriggerPips && sl != 0)
+         if(UseBreakeven && profitPips >= beTrigger && sl != 0)
          {
             double newSL = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
-                           openPrice + BreakevenOffsetPips * point * 10 :
-                           openPrice - BreakevenOffsetPips * point * 10;
+                           openPrice + beOffset * point * 10 :
+                           openPrice - beOffset * point * 10;
 
             newSL = NormalizeDouble(newSL, _Digits);
 
@@ -924,12 +1010,13 @@ void ManagePositions()
                (posInfo.PositionType() == POSITION_TYPE_SELL && (newSL < sl || sl == 0)))
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Position ", ticket, " moved to breakeven+", DoubleToString(BreakevenOffsetPips, 0), " pips");
+                  Print(isTwinB ? "TWIN-B" : "Position", " ", ticket,
+                        " → breakeven +", DoubleToString(beOffset, 0), " pips locked");
             }
          }
 
-         // Partial close
-         if(UsePartialClose && profitPips >= BreakevenTriggerPips * 2)
+         // Partial close (only for non-twin single trades)
+         if(!isTwinB && UsePartialClose && profitPips >= BreakevenTriggerPips * 2)
          {
             double closeVolume = posInfo.Volume() * PartialClosePercent / 100.0;
             double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -961,14 +1048,37 @@ void ManageTrailingStops()
          if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
             continue;
 
+         string comment = posInfo.Comment();
+         bool isTwinA = (StringFind(comment, "TwinA") >= 0);
+         bool isTwinB = (StringFind(comment, "TwinB") >= 0);
+
+         // TwinA positions: NO trailing - just let them run to TP/SL
+         if(isTwinA)
+            continue;
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
          double sl = posInfo.StopLoss();
-         double trailDistance = TrailingStopPips * point * 10;
-         double trailStep = TrailingStepPips * point * 10;
+         double openPrice = posInfo.PriceOpen();
+
+         // Determine which parameters to use
+         double trailPips = isTwinB ? TwinB_Trail_Pips : TrailingStopPips;
+         double stepPips = isTwinB ? TwinB_Trail_Step : TrailingStepPips;
+         double trailDistance = trailPips * point * 10;
+         double trailStep = stepPips * point * 10;
+
+         // Only trail after breakeven has been activated (SL is better than entry)
+         bool beActive = false;
+         if(posInfo.PositionType() == POSITION_TYPE_SELL)
+            beActive = (sl < openPrice);  // SL below entry = profit locked
+         else
+            beActive = (sl > openPrice);  // SL above entry = profit locked
+
+         if(!beActive)
+            continue;  // Don't trail until breakeven is activated
 
          if(posInfo.PositionType() == POSITION_TYPE_BUY && sl > 0)
          {
@@ -976,7 +1086,8 @@ void ManageTrailingStops()
             if(newSL > sl + trailStep)
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Trailing stop updated for BUY ", ticket);
+                  Print(isTwinB ? "TWIN-B" : "Position", " ", ticket,
+                        " trailing → SL=", DoubleToString(newSL, _Digits));
             }
          }
          else if(posInfo.PositionType() == POSITION_TYPE_SELL && sl > 0)
@@ -985,7 +1096,8 @@ void ManageTrailingStops()
             if(newSL < sl - trailStep)
             {
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit()))
-                  Print("Trailing stop updated for SELL ", ticket);
+                  Print(isTwinB ? "TWIN-B" : "Position", " ", ticket,
+                        " trailing → SL=", DoubleToString(newSL, _Digits));
             }
          }
       }
