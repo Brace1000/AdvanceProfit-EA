@@ -14,12 +14,13 @@
 input group "=== ML API Settings ==="
 input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
 input double ML_Confidence_Threshold = 0.34; // Minimum confidence (34%)
+input double MinConfidenceSpread = 0.015;    // Sell must beat buy/range by 1.5%
 
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
 input double MaxDailyLoss = 3.0;             // Max daily loss (% of balance)
 input double MaxDailyProfit = 5.0;           // Daily profit target (%)
-input int    MaxSimultaneousTrades = 2;      // Maximum open positions (2 for twin trades)
+input int    MaxSimultaneousTrades = 2;      // Max AT-RISK positions (protected positions don't count)
 input double TP_Pips = 20.0;                // Take Profit (pips) - fixed barrier
 input double SL_Pips = 15.0;                // Stop Loss (pips) - fixed barrier
 
@@ -159,6 +160,7 @@ int OnInit()
    {
       Print("API URL: ", API_URL);
       Print("Confidence Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
+      Print("Min Confidence Spread: ", DoubleToString(MinConfidenceSpread * 100, 1), "% (sell must beat buy/range)");
    }
    Print("TP: ", TP_Pips, " pips | SL: ", SL_Pips, " pips");
    if(UseTwinTrades)
@@ -240,12 +242,20 @@ void OnTick()
          return;
       }
 
-      if(CountOpenPositions() < MaxSimultaneousTrades)
+      // Use at-risk count: protected positions (BE activated) don't block new trades
+      int atRisk = CountAtRiskPositions();
+      int totalOpen = CountOpenPositions();
+
+      if(atRisk < MaxSimultaneousTrades)
       {
          int signal = GetTradeSignal();
 
          if(signal == -1)
+         {
+            if(totalOpen > atRisk)
+               Print("Opening new trade: ", totalOpen, " open but only ", atRisk, " at risk");
             OpenSellTrade();
+         }
       }
    }
 }
@@ -632,14 +642,28 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 
    string prediction = ExtractStringValue(response, "prediction");
 
+   // Calculate confidence spread: sell must beat max(buy, range) by threshold
+   double max_other = MathMax(buy_prob, range_prob);
+   double conf_spread = sell_prob - max_other;
+
    Print("ML: ", prediction, " | Sell=", DoubleToString(sell_prob*100, 1),
          "% Range=", DoubleToString(range_prob*100, 1),
          "% Buy=", DoubleToString(buy_prob*100, 1),
-         "% | Conf=", DoubleToString(confidence*100, 1), "%");
+         "% | Spread=", DoubleToString(conf_spread*100, 1), "%");
 
-   // SELL-ONLY: only return sell signal
+   // SELL-ONLY: only return sell signal if:
+   // 1. Prediction is sell
+   // 2. Confidence >= threshold (34%)
+   // 3. Sell confidence beats max(buy, range) by MinConfidenceSpread (1.5%)
    if(prediction == "sell" && confidence >= ML_Confidence_Threshold)
-      return -1;
+   {
+      if(conf_spread >= MinConfidenceSpread)
+         return -1;  // Valid sell signal
+
+      Print("Confidence spread too low: ", DoubleToString(conf_spread*100, 1),
+            "% < ", DoubleToString(MinConfidenceSpread*100, 1), "% required");
+      return 0;
+   }
 
    if(confidence < ML_Confidence_Threshold)
       Print("Confidence below threshold: ", DoubleToString(confidence*100, 1),
@@ -1265,6 +1289,49 @@ int CountOpenPositions()
       if(posInfo.SelectByIndex(i))
          if(posInfo.Symbol() == _Symbol && posInfo.Magic() == 123456)
             count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Count at-risk positions (SL worse than entry)                    |
+//| Protected positions (SL at breakeven or better) don't count      |
+//+------------------------------------------------------------------+
+int CountAtRiskPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
+            continue;
+
+         double sl = posInfo.StopLoss();
+         double entry = posInfo.PriceOpen();
+
+         // No SL = at risk
+         if(sl == 0)
+         {
+            count++;
+            continue;
+         }
+
+         // For SELL: SL > entry means at risk (loss if hit)
+         // For BUY: SL < entry means at risk (loss if hit)
+         if(posInfo.PositionType() == POSITION_TYPE_SELL)
+         {
+            if(sl > entry)  // SL above entry = would be a loss
+               count++;
+            // else: SL <= entry = protected (breakeven or profit locked)
+         }
+         else // BUY
+         {
+            if(sl < entry)  // SL below entry = would be a loss
+               count++;
+            // else: SL >= entry = protected
+         }
+      }
    }
    return count;
 }
