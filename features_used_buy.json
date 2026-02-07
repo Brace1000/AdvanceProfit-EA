@@ -1,0 +1,16 @@
+[
+  "close_ema50_h1",
+  "ema50_ema200_h1",
+  "rsi_h1",
+  "atr_ratio_h1",
+  "squeeze_ratio_h1",
+  "choppiness_h1",
+  "body_ratio_h1",
+  "ema50_ema200_h4",
+  "atr_ratio_h4",
+  "adx_h4",
+  "squeeze_ratio_h4",
+  "choppiness_h4",
+  "body_ratio_h4",
+  "range_pct_h4"
+]

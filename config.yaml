@@ -26,7 +26,8 @@ data_sources:
 
 # Model Configuration
 model:
-  path: "xgb_eurusd_h1.pkl"
+  path: "models/xgb_eurusd_h1.pkl"
+  buy_path: "models/xgb_eurusd_h1_buy.pkl"
   feature_count: 15  # H1(8) + H4(7) - normalized, no calendar features
   features:
     # H1 features (8): trend + momentum + volatility + regime
@@ -228,5 +229,5 @@ paths:
   logs: "logs"
   experiments: "experiments"
   notebooks: "notebooks"
-  data_raw_file: "EURUSD_H1_clean.csv"
-  data_processed_file: "EURUSD_H1_clean.csv"
+  data_raw_file: "data/EURUSD_H1_clean.csv"
+  data_processed_file: "data/EURUSD_H1_clean.csv"
