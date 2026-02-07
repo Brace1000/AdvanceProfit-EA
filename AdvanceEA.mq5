@@ -642,9 +642,12 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 
    string prediction = ExtractStringValue(response, "prediction");
 
+   // Round confidence to avoid floating point precision issues
+   confidence = NormalizeDouble(confidence, 4);
+
    // Calculate confidence spread: sell must beat max(buy, range) by threshold
    double max_other = MathMax(buy_prob, range_prob);
-   double conf_spread = sell_prob - max_other;
+   double conf_spread = NormalizeDouble(sell_prob - max_other, 4);
 
    Print("ML: ", prediction, " | Sell=", DoubleToString(sell_prob*100, 1),
          "% Range=", DoubleToString(range_prob*100, 1),
