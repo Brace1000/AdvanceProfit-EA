@@ -1,20 +1,29 @@
 //+------------------------------------------------------------------+
 //|                                     AdvancedProfitEA_ML.mq5      |
-//|                   Sell-Only ML Trading System (14 features)       |
+//|                        ML Trading System (14 features)            |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
-#property version   "3.00"
+#property version   "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\AccountInfo.mqh>
 
+// Trade direction enum
+enum ENUM_TRADE_DIRECTION
+{
+   TRADE_BUY_ONLY,   // BUY ONLY
+   TRADE_SELL_ONLY    // SELL ONLY
+};
+
 // Input Parameters
 input group "=== ML API Settings ==="
-input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
-input double ML_Confidence_Threshold = 0.34; // Minimum confidence (34%)
-input double MinConfidenceSpread = 0.015;    // Sell must beat buy/range by 1.5%
+input ENUM_TRADE_DIRECTION TradeDirection = TRADE_BUY_ONLY; // Trade Direction
+input string API_URL_Buy  = "http://127.0.0.1:8000/predict/buy"; // Buy API endpoint
+input string API_URL_Sell = "http://127.0.0.1:8000/predict";     // Sell API endpoint
+input double ML_Confidence_Threshold = 0.40; // Minimum confidence (40%)
+input double MinConfidenceSpread = 0.015;    // Signal must beat others by 1.5%
 
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
@@ -41,7 +50,7 @@ input int    StartHour = 8;                  // Trading start hour
 input int    EndHour = 20;                   // Trading end hour
 
 input group "=== Regime Filter ==="
-input bool   UseRegimeFilter = true;         // Only trade in trending regimes
+input bool   UseRegimeFilter = false;        // Only trade in trending regimes
 input int    RegimeLookback = 500;           // Bars for rolling median
 
 input group "=== Circuit Breaker ==="
@@ -114,7 +123,7 @@ double ComputeRollingMedian(ENUM_TIMEFRAMES tf, int shift, int lookback);
 int OnInit()
 {
    Print("========================================");
-   Print("Advanced Profit EA v3.00 - Sell-Only ML (14 features)");
+   Print("Advanced Profit EA v4.00 - ML Trading System (14 features)");
    Print("========================================");
 
    // Technical indicators
@@ -154,13 +163,14 @@ int OnInit()
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
 
+   Print("Trade Direction: ", (TradeDirection == TRADE_BUY_ONLY) ? "BUY ONLY" : "SELL ONLY");
    Print("Mode: ", TechnicalOnly ? "TECHNICAL ONLY (no ML)" :
          (CombineWithTechnical ? "ML + Technical Confluence" : "ML-Only"));
    if(!TechnicalOnly)
    {
-      Print("API URL: ", API_URL);
+      Print("API URL: ", GetActiveAPIURL());
       Print("Confidence Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
-      Print("Min Confidence Spread: ", DoubleToString(MinConfidenceSpread * 100, 1), "% (sell must beat buy/range)");
+      Print("Min Confidence Spread: ", DoubleToString(MinConfidenceSpread * 100, 1), "% (signal must beat others)");
    }
    Print("TP: ", TP_Pips, " pips | SL: ", SL_Pips, " pips");
    if(UseTwinTrades)
@@ -250,7 +260,13 @@ void OnTick()
       {
          int signal = GetTradeSignal();
 
-         if(signal == -1)
+         if(TradeDirection == TRADE_BUY_ONLY && signal == 1)
+         {
+            if(totalOpen > atRisk)
+               Print("Opening new trade: ", totalOpen, " open but only ", atRisk, " at risk");
+            OpenBuyTrade();
+         }
+         else if(TradeDirection == TRADE_SELL_ONLY && signal == -1)
          {
             if(totalOpen > atRisk)
                Print("Opening new trade: ", totalOpen, " open but only ", atRisk, " at risk");
@@ -281,6 +297,21 @@ int GetTechnicalSignal()
 
    bool upTrend = close > trendMA[0];
    bool downTrend = close < trendMA[0];
+
+   // Bullish crossover: fast MA crosses above slow MA
+   bool bullishCross = (maFast[1] > maSlow[1] && maFast[2] <= maSlow[2]);
+
+   // RSI in bullish zone
+   bool rsiBullish = rsi[0] > 50 && rsi[0] < RSI_Overbought;
+
+   if(bullishCross && rsiBullish)
+   {
+      if(!UseTrendFilter || upTrend)
+      {
+         Print("Technical BUY: Bullish cross + RSI=", DoubleToString(rsi[0], 1));
+         return 1;
+      }
+   }
 
    // Bearish crossover: fast MA crosses below slow MA
    bool bearishCross = (maFast[1] < maSlow[1] && maFast[2] >= maSlow[2]);
@@ -450,6 +481,17 @@ double ComputeRollingMedian(ENUM_TIMEFRAMES tf, int shift, int lookback)
 }
 
 //+------------------------------------------------------------------+
+//| Get active API URL based on trade direction                      |
+//+------------------------------------------------------------------+
+string GetActiveAPIURL()
+{
+   if(TradeDirection == TRADE_BUY_ONLY)
+      return API_URL_Buy;
+   else
+      return API_URL_Sell;
+}
+
+//+------------------------------------------------------------------+
 //| Get ML prediction from Python API (14 features)                  |
 //| Feature order matches features_used.json exactly                 |
 //+------------------------------------------------------------------+
@@ -598,9 +640,10 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
    ResetLastError();
 
    string headers = "Content-Type: application/json\r\n";
+   string activeURL = GetActiveAPIURL();
    int res = WebRequest(
       "POST",
-      API_URL,
+      activeURL,
       headers,
       timeout,
       post_data,
@@ -645,36 +688,61 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
    // Round confidence to avoid floating point precision issues
    confidence = NormalizeDouble(confidence, 4);
 
-   // Calculate confidence spread: sell must beat max(buy, range) by threshold
-   double max_other = MathMax(buy_prob, range_prob);
-   double conf_spread = NormalizeDouble(sell_prob - max_other, 4);
-
-   Print("ML: ", prediction, " | Sell=", DoubleToString(sell_prob*100, 1),
-         "% Range=", DoubleToString(range_prob*100, 1),
-         "% Buy=", DoubleToString(buy_prob*100, 1),
-         "% | Spread=", DoubleToString(conf_spread*100, 1), "%");
-
-   // SELL-ONLY: only return sell signal if:
-   // 1. Prediction is sell
-   // 2. Confidence >= threshold (34%)
-   // 3. Sell confidence beats max(buy, range) by MinConfidenceSpread (1.5%)
-   if(prediction == "sell" && confidence >= ML_Confidence_Threshold)
+   // Direction-aware signal logic
+   if(TradeDirection == TRADE_BUY_ONLY)
    {
-      if(conf_spread >= MinConfidenceSpread)
-         return -1;  // Valid sell signal
+      // BUY MODE: buy_prob must dominate max(sell, range)
+      double max_other = MathMax(sell_prob, range_prob);
+      double conf_spread = NormalizeDouble(buy_prob - max_other, 4);
 
-      Print("Confidence spread too low: ", DoubleToString(conf_spread*100, 1),
-            "% < ", DoubleToString(MinConfidenceSpread*100, 1), "% required");
+      Print("ML: ", prediction, " | Buy=", DoubleToString(buy_prob*100, 1),
+            "% Range=", DoubleToString(range_prob*100, 1),
+            "% Sell=", DoubleToString(sell_prob*100, 1),
+            "% | Spread=", DoubleToString(conf_spread*100, 1), "%");
+
+      if(buy_prob >= ML_Confidence_Threshold)
+      {
+         if(conf_spread >= MinConfidenceSpread)
+            return 1;  // Valid buy signal
+
+         Print("Confidence spread too low: ", DoubleToString(conf_spread*100, 1),
+               "% < ", DoubleToString(MinConfidenceSpread*100, 1), "% required");
+         return 0;
+      }
+
+      if(buy_prob < ML_Confidence_Threshold)
+         Print("Buy prob below threshold: ", DoubleToString(buy_prob*100, 1),
+               "% < ", DoubleToString(ML_Confidence_Threshold*100, 1), "%");
+
       return 0;
    }
+   else
+   {
+      // SELL MODE: sell_prob must dominate max(buy, range)
+      double max_other = MathMax(buy_prob, range_prob);
+      double conf_spread = NormalizeDouble(sell_prob - max_other, 4);
 
-   if(confidence < ML_Confidence_Threshold)
-      Print("Confidence below threshold: ", DoubleToString(confidence*100, 1),
-            "% < ", DoubleToString(ML_Confidence_Threshold*100, 1), "%");
-   else if(prediction != "sell")
-      Print("Non-sell prediction ignored: ", prediction);
+      Print("ML: ", prediction, " | Sell=", DoubleToString(sell_prob*100, 1),
+            "% Range=", DoubleToString(range_prob*100, 1),
+            "% Buy=", DoubleToString(buy_prob*100, 1),
+            "% | Spread=", DoubleToString(conf_spread*100, 1), "%");
 
-   return 0;
+      if(sell_prob >= ML_Confidence_Threshold)
+      {
+         if(conf_spread >= MinConfidenceSpread)
+            return -1;  // Valid sell signal
+
+         Print("Confidence spread too low: ", DoubleToString(conf_spread*100, 1),
+               "% < ", DoubleToString(MinConfidenceSpread*100, 1), "% required");
+         return 0;
+      }
+
+      if(sell_prob < ML_Confidence_Threshold)
+         Print("Sell prob below threshold: ", DoubleToString(sell_prob*100, 1),
+               "% < ", DoubleToString(ML_Confidence_Threshold*100, 1), "%");
+
+      return 0;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -682,6 +750,10 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 //+------------------------------------------------------------------+
 int GetTradeSignal()
 {
+   // Direction-aware target signal: +1 for Buy, -1 for Sell
+   int target_signal = (TradeDirection == TRADE_BUY_ONLY) ? 1 : -1;
+   string dir_label = (TradeDirection == TRADE_BUY_ONLY) ? "BUY" : "SELL";
+
    // Time filter
    if(UseTimeFilter && !IsWithinTradingHours())
       return 0;
@@ -692,11 +764,11 @@ int GetTradeSignal()
    // ─── TECHNICAL ONLY MODE ───
    if(TechnicalOnly)
    {
-      if(tech_signal != -1)
+      if(tech_signal != target_signal)
          return 0;
 
-      Print(">>> Technical SELL signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI bearish");
-      return -1;
+      Print(">>> Technical ", dir_label, " signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI");
+      return target_signal;
    }
 
    // ─── ML MODES (ML-only or ML+Technical) ───
@@ -707,41 +779,36 @@ int GetTradeSignal()
    // Combine logic
    if(!CombineWithTechnical)
    {
-      // ML-only mode (original behavior)
+      // ML-only mode
       if(ml_signal == 0)
          return 0;
    }
    else
    {
       // Combined mode: Technical generates signal, ML confirms or fills gap
-      if(tech_signal == -1)
+      if(tech_signal == target_signal)
       {
-         // Technical says SELL
-         if(ml_signal == -1 && ml_confidence >= ML_Confidence_Threshold)
+         // Technical agrees with direction
+         if(ml_signal == target_signal && ml_confidence >= ML_Confidence_Threshold)
          {
-            // Both agree - strongest signal
-            Print("✓ ML + Technical AGREE: SELL");
+            Print("+ ML + Technical AGREE: ", dir_label);
          }
          else if(ml_confidence < ML_Confidence_Threshold)
          {
-            // Technical strong, ML weak - use technical
-            Print("✓ Technical SELL (ML weak: ", DoubleToString(ml_confidence*100, 1), "%)");
+            Print("+ Technical ", dir_label, " (ML weak: ", DoubleToString(ml_confidence*100, 1), "%)");
          }
          else
          {
-            // Technical SELL but ML disagrees
-            Print("✗ Technical SELL but ML says no");
+            Print("x Technical ", dir_label, " but ML says no");
             return 0;
          }
       }
-      else if(ml_signal == -1 && ml_confidence >= ML_Confidence_Threshold)
+      else if(ml_signal == target_signal && ml_confidence >= ML_Confidence_Threshold)
       {
-         // ML SELL but no technical - still go (ML-only signal)
-         Print("✓ ML SELL (Technical no signal)");
+         Print("+ ML ", dir_label, " (Technical no signal)");
       }
       else
       {
-         // No valid signal
          return 0;
       }
    }
@@ -769,7 +836,7 @@ int GetTradeSignal()
             " < ", DoubleToString(median_h4, 1));
    }
 
-   return -1; // SELL signal
+   return target_signal;
 }
 
 //+------------------------------------------------------------------+
@@ -852,6 +919,89 @@ void OpenSellTrade()
       else
       {
          Print("Failed to open SELL: ", trade.ResultRetcodeDescription());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY trade with fixed TP/SL                                  |
+//+------------------------------------------------------------------+
+void OpenBuyTrade()
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pipSize = point * 10;  // 1 pip = 10 points for 5-digit broker
+
+   double slDistance = SL_Pips * pipSize;
+   double sl = NormalizeDouble(price - slDistance, _Digits);
+
+   // Calculate total lot size based on risk
+   double totalLotSize = CalculateLotSize(slDistance);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(UseTwinTrades)
+   {
+      // Twin Trade System
+      double halfLot = MathFloor((totalLotSize / 2.0) / lotStep) * lotStep;
+      if(halfLot < minLot) halfLot = minLot;
+
+      // Trade A: The Banker (quick TP, no trailing)
+      double tpA = NormalizeDouble(price + TwinA_TP_Pips * pipSize, _Digits);
+      string commentA = "TwinA TP=" + DoubleToString(TwinA_TP_Pips, 0);
+
+      if(trade.Buy(halfLot, _Symbol, price, sl, tpA, commentA))
+      {
+         Print("TWIN-A (Banker) BUY opened: Lot=", DoubleToString(halfLot, 2),
+               " TP=", DoubleToString(TwinA_TP_Pips, 0), " pips");
+      }
+      else
+      {
+         Print("Failed to open TWIN-A BUY: ", trade.ResultRetcodeDescription());
+      }
+
+      // Trade B: The Runner (full TP, with BE + trailing)
+      double tpB = NormalizeDouble(price + TwinB_TP_Pips * pipSize, _Digits);
+      string commentB = "TwinB TP=" + DoubleToString(TwinB_TP_Pips, 0);
+
+      if(trade.Buy(halfLot, _Symbol, price, sl, tpB, commentB))
+      {
+         Print("TWIN-B (Runner) BUY opened: Lot=", DoubleToString(halfLot, 2),
+               " TP=", DoubleToString(TwinB_TP_Pips, 0), " pips (BE@",
+               DoubleToString(TwinB_BE_Trigger, 0), ", Trail@",
+               DoubleToString(TwinB_Trail_Pips, 0), ")");
+         totalTradesToday++;
+      }
+      else
+      {
+         Print("Failed to open TWIN-B BUY: ", trade.ResultRetcodeDescription());
+      }
+   }
+   else
+   {
+      // Single trade mode
+      double tpDistance = TP_Pips * pipSize;
+      double tp = NormalizeDouble(price + tpDistance, _Digits);
+
+      if(totalLotSize < minLot)
+      {
+         Print("Lot size too small: ", DoubleToString(totalLotSize, 4), ", using minimum: ", DoubleToString(minLot, 2));
+         totalLotSize = minLot;
+      }
+
+      string comment = "ML Buy TP=" + DoubleToString(TP_Pips, 0) + "/SL=" + DoubleToString(SL_Pips, 0);
+
+      if(trade.Buy(totalLotSize, _Symbol, price, sl, tp, comment))
+      {
+         Print("BUY opened: Lot=", DoubleToString(totalLotSize, 2),
+               " Price=", DoubleToString(price, _Digits),
+               " SL=", DoubleToString(sl, _Digits),
+               " TP=", DoubleToString(tp, _Digits));
+         totalTradesToday++;
+      }
+      else
+      {
+         Print("Failed to open BUY: ", trade.ResultRetcodeDescription());
       }
    }
 }
