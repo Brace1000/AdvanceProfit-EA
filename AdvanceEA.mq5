@@ -14,7 +14,8 @@
 enum ENUM_TRADE_DIRECTION
 {
    TRADE_BUY_ONLY,   // BUY ONLY
-   TRADE_SELL_ONLY    // SELL ONLY
+   TRADE_SELL_ONLY,   // SELL ONLY
+   TRADE_BOTH         // BOTH (Buy + Sell via Buy model)
 };
 
 // Input Parameters
@@ -22,7 +23,8 @@ input group "=== ML API Settings ==="
 input ENUM_TRADE_DIRECTION TradeDirection = TRADE_BUY_ONLY; // Trade Direction
 input string API_URL_Buy  = "http://127.0.0.1:8000/predict/buy"; // Buy API endpoint
 input string API_URL_Sell = "http://127.0.0.1:8000/predict";     // Sell API endpoint
-input double ML_Confidence_Threshold = 0.40; // Minimum confidence (40%)
+input double ML_Confidence_Threshold = 0.40; // Buy confidence threshold (40%)
+input double ML_Sell_Threshold = 0.56;       // Sell confidence threshold (56%, BOTH mode)
 input double MinConfidenceSpread = 0.015;    // Signal must beat others by 1.5%
 
 input group "=== Risk Management ==="
@@ -163,13 +165,17 @@ int OnInit()
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
 
-   Print("Trade Direction: ", (TradeDirection == TRADE_BUY_ONLY) ? "BUY ONLY" : "SELL ONLY");
+   string dirStr = (TradeDirection == TRADE_BUY_ONLY) ? "BUY ONLY" :
+                   (TradeDirection == TRADE_SELL_ONLY) ? "SELL ONLY" : "BOTH (Buy + Sell)";
+   Print("Trade Direction: ", dirStr);
    Print("Mode: ", TechnicalOnly ? "TECHNICAL ONLY (no ML)" :
          (CombineWithTechnical ? "ML + Technical Confluence" : "ML-Only"));
    if(!TechnicalOnly)
    {
       Print("API URL: ", GetActiveAPIURL());
-      Print("Confidence Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
+      Print("Buy Threshold: ", DoubleToString(ML_Confidence_Threshold * 100, 0), "%");
+      if(TradeDirection == TRADE_BOTH)
+         Print("Sell Threshold: ", DoubleToString(ML_Sell_Threshold * 100, 0), "%");
       Print("Min Confidence Spread: ", DoubleToString(MinConfidenceSpread * 100, 1), "% (signal must beat others)");
    }
    Print("TP: ", TP_Pips, " pips | SL: ", SL_Pips, " pips");
@@ -260,13 +266,13 @@ void OnTick()
       {
          int signal = GetTradeSignal();
 
-         if(TradeDirection == TRADE_BUY_ONLY && signal == 1)
+         if(signal == 1 && (TradeDirection == TRADE_BUY_ONLY || TradeDirection == TRADE_BOTH))
          {
             if(totalOpen > atRisk)
                Print("Opening new trade: ", totalOpen, " open but only ", atRisk, " at risk");
             OpenBuyTrade();
          }
-         else if(TradeDirection == TRADE_SELL_ONLY && signal == -1)
+         else if(signal == -1 && (TradeDirection == TRADE_SELL_ONLY || TradeDirection == TRADE_BOTH))
          {
             if(totalOpen > atRisk)
                Print("Opening new trade: ", totalOpen, " open but only ", atRisk, " at risk");
@@ -485,7 +491,7 @@ double ComputeRollingMedian(ENUM_TIMEFRAMES tf, int shift, int lookback)
 //+------------------------------------------------------------------+
 string GetActiveAPIURL()
 {
-   if(TradeDirection == TRADE_BUY_ONLY)
+   if(TradeDirection == TRADE_BUY_ONLY || TradeDirection == TRADE_BOTH)
       return API_URL_Buy;
    else
       return API_URL_Sell;
@@ -689,7 +695,43 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
    confidence = NormalizeDouble(confidence, 4);
 
    // Direction-aware signal logic
-   if(TradeDirection == TRADE_BUY_ONLY)
+   if(TradeDirection == TRADE_BOTH)
+   {
+      // BOTH MODE: Check buy first (priority), then sell — single API call
+      Print("ML: ", prediction, " | Buy=", DoubleToString(buy_prob*100, 1),
+            "% Range=", DoubleToString(range_prob*100, 1),
+            "% Sell=", DoubleToString(sell_prob*100, 1), "%");
+
+      // Check BUY signal (threshold 0.40)
+      double buy_spread = NormalizeDouble(buy_prob - MathMax(sell_prob, range_prob), 4);
+      if(buy_prob >= ML_Confidence_Threshold && buy_spread >= MinConfidenceSpread)
+      {
+         Print(">>> BUY signal: prob=", DoubleToString(buy_prob*100, 1),
+               "% spread=", DoubleToString(buy_spread*100, 1), "%");
+         return 1;
+      }
+
+      // Check SELL signal (threshold 0.56)
+      double sell_spread = NormalizeDouble(sell_prob - MathMax(buy_prob, range_prob), 4);
+      if(sell_prob >= ML_Sell_Threshold)
+      {
+         Print(">>> SELL signal: prob=", DoubleToString(sell_prob*100, 1),
+               "% spread=", DoubleToString(sell_spread*100, 1), "%");
+         return -1;
+      }
+
+      // No signal
+      if(buy_prob >= ML_Confidence_Threshold)
+         Print("Buy spread too low: ", DoubleToString(buy_spread*100, 1), "%");
+      else if(sell_prob >= ML_Confidence_Threshold)
+         Print("Sell below sell threshold: ", DoubleToString(sell_prob*100, 1),
+               "% < ", DoubleToString(ML_Sell_Threshold*100, 0), "%");
+      else
+         Print("No signal: max prob=", DoubleToString(MathMax(buy_prob, sell_prob)*100, 1), "%");
+
+      return 0;
+   }
+   else if(TradeDirection == TRADE_BUY_ONLY)
    {
       // BUY MODE: buy_prob must dominate max(sell, range)
       double max_other = MathMax(sell_prob, range_prob);
@@ -750,10 +792,6 @@ int GetMLPrediction(double &confidence, double &chop_h1_out, double &chop_h4_out
 //+------------------------------------------------------------------+
 int GetTradeSignal()
 {
-   // Direction-aware target signal: +1 for Buy, -1 for Sell
-   int target_signal = (TradeDirection == TRADE_BUY_ONLY) ? 1 : -1;
-   string dir_label = (TradeDirection == TRADE_BUY_ONLY) ? "BUY" : "SELL";
-
    // Time filter
    if(UseTimeFilter && !IsWithinTradingHours())
       return 0;
@@ -764,10 +802,24 @@ int GetTradeSignal()
    // ─── TECHNICAL ONLY MODE ───
    if(TechnicalOnly)
    {
+      if(TradeDirection == TRADE_BOTH)
+      {
+         // BOTH: accept any technical signal
+         if(tech_signal != 0)
+         {
+            Print(">>> Technical ", (tech_signal == 1 ? "BUY" : "SELL"),
+                  " signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI");
+            return tech_signal;
+         }
+         return 0;
+      }
+
+      int target_signal = (TradeDirection == TRADE_BUY_ONLY) ? 1 : -1;
       if(tech_signal != target_signal)
          return 0;
 
-      Print(">>> Technical ", dir_label, " signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI");
+      Print(">>> Technical ", (target_signal == 1 ? "BUY" : "SELL"),
+            " signal: MA(", MA_Fast, ",", MA_Slow, ") cross + RSI");
       return target_signal;
    }
 
@@ -779,36 +831,29 @@ int GetTradeSignal()
    // Combine logic
    if(!CombineWithTechnical)
    {
-      // ML-only mode
+      // ML-only mode: pass through whatever ML returned (+1, -1, or 0)
       if(ml_signal == 0)
          return 0;
    }
    else
    {
-      // Combined mode: Technical generates signal, ML confirms or fills gap
-      if(tech_signal == target_signal)
+      // Combined mode: ML signal must exist, technical can strengthen or veto
+      if(ml_signal == 0)
+         return 0;
+
+      string dir_label = (ml_signal == 1) ? "BUY" : "SELL";
+
+      if(tech_signal == ml_signal)
       {
-         // Technical agrees with direction
-         if(ml_signal == target_signal && ml_confidence >= ML_Confidence_Threshold)
-         {
-            Print("+ ML + Technical AGREE: ", dir_label);
-         }
-         else if(ml_confidence < ML_Confidence_Threshold)
-         {
-            Print("+ Technical ", dir_label, " (ML weak: ", DoubleToString(ml_confidence*100, 1), "%)");
-         }
-         else
-         {
-            Print("x Technical ", dir_label, " but ML says no");
-            return 0;
-         }
+         Print("+ ML + Technical AGREE: ", dir_label);
       }
-      else if(ml_signal == target_signal && ml_confidence >= ML_Confidence_Threshold)
+      else if(tech_signal == 0)
       {
          Print("+ ML ", dir_label, " (Technical no signal)");
       }
       else
       {
+         Print("x ML ", dir_label, " but Technical disagrees");
          return 0;
       }
    }
@@ -836,7 +881,7 @@ int GetTradeSignal()
             " < ", DoubleToString(median_h4, 1));
    }
 
-   return target_signal;
+   return ml_signal;
 }
 
 //+------------------------------------------------------------------+
