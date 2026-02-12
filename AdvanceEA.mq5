@@ -66,6 +66,8 @@ double dailyStartBalance;
 datetime lastBarTime;
 int totalTradesToday = 0;
 double dailyProfitLoss = 0.0;
+int mlConsecutiveFailures = 0;            // API failure counter
+const int ML_MAX_CONSECUTIVE_FAILURES = 5; // Auto-disable ML after this many
 
 // Forward declarations for helper functions
 string StringTrimCustom(const string str);
@@ -199,7 +201,14 @@ int GetMLPrediction(double &confidence)
 {
    if(!UseMLPredictions)
       return 0;
-   
+
+   // Auto-disable ML after too many consecutive API failures
+   if(mlConsecutiveFailures >= ML_MAX_CONSECUTIVE_FAILURES)
+   {
+      Print("ML disabled: ", mlConsecutiveFailures, " consecutive API failures. Restart EA to re-enable.");
+      return 0;
+   }
+
    // H1 indicator buffers
    double ema50_h1[2], ema200_h1[2], rsi_h1[2], atr_h1[2], adx_h1[2];
    double close_h1[3], open_h1[2], high_h1[2], low_h1[2];
@@ -315,6 +324,30 @@ int GetMLPrediction(double &confidence)
    // if(close_h4[1] != 0.0)
    //    prev_return_h4 = (close_h4[0] - close_h4[1]) / close_h4[1];
 
+   // Validate features before sending to API
+   if(!MathIsValidNumber(close_ema50_h1) || !MathIsValidNumber(ema50_ema200_h1) ||
+      !MathIsValidNumber(rsi_val_h1) || !MathIsValidNumber(rsi_slope_h1) ||
+      !MathIsValidNumber(atr_ratio_h1) || !MathIsValidNumber(body_h1) ||
+      !MathIsValidNumber(range_h1) ||
+      !MathIsValidNumber(ema50_ema200_h4) || !MathIsValidNumber(rsi_val_h4) ||
+      !MathIsValidNumber(rsi_slope_h4) || !MathIsValidNumber(atr_ratio_h4) ||
+      !MathIsValidNumber(adx_val_h4) || !MathIsValidNumber(body_h4) ||
+      !MathIsValidNumber(range_h4))
+   {
+      Print("Feature validation failed: one or more features are NaN/Inf");
+      return 0;
+   }
+   if(rsi_val_h1 < 0 || rsi_val_h1 > 100 || rsi_val_h4 < 0 || rsi_val_h4 > 100)
+   {
+      Print("Feature validation failed: RSI out of [0,100] — H1=", rsi_val_h1, " H4=", rsi_val_h4);
+      return 0;
+   }
+   if(hour < 0 || hour > 23)
+   {
+      Print("Feature validation failed: hour=", hour, " out of [0,23]");
+      return 0;
+   }
+
    // Build JSON request with 23 features (after correlation pruning) in exact order expected by Python
    // Pruned features: close_ema50_h4, adx_h1, prev_return_h1, prev_return_h4
    string features = StringFormat(
@@ -333,51 +366,63 @@ int GetMLPrediction(double &confidence)
    
    string json_request = "{\"features\":" + features + "}";
    
-   // Make HTTP request
+   // Make HTTP request with retry logic (max 3 attempts, 1s backoff)
    uchar post_data[];
    uchar result_data[];
    string result_headers;
-   
+
    StringToCharArray(json_request, post_data, 0, StringLen(json_request));
-   
+
    int timeout = 5000; // 5 seconds
-   ResetLastError();
-   
    string headers = "Content-Type: application/json\r\n";
-   int res = WebRequest(
-      "POST",
-      API_URL,
-      headers,
-      timeout,
-      post_data,
-      result_data,
-      result_headers
-   );
-   
-   if(res == -1)
+   int res = -1;
+   int maxRetries = 3;
+
+   for(int attempt = 1; attempt <= maxRetries; attempt++)
    {
+      ResetLastError();
+      ArrayFree(result_data);
+
+      res = WebRequest(
+         "POST",
+         API_URL,
+         headers,
+         timeout,
+         post_data,
+         result_data,
+         result_headers
+      );
+
+      if(res != -1)
+         break;  // Success
+
       int last_error = GetLastError();
-      string error_desc = "";
-      
-      switch(last_error)
-      {
-         case 4016: error_desc = "URL not allowed in WebRequest list"; break;
-         case 4018: error_desc = "WebRequest is disabled"; break;
-         case 4060: error_desc = "Network error"; break;
-         case 4061: error_desc = "Timeout"; break;
-         case 4062: error_desc = "Invalid URL"; break;
-         default: error_desc = "Unknown error"; break;
-      }
-      
-      Print("WebRequest error ", last_error, ": ", error_desc);
+
+      // Non-retryable config errors — fail immediately
       if(last_error == 4016 || last_error == 4018)
       {
+         Print("WebRequest config error ", last_error, ": URL not allowed or WebRequest disabled");
          Print("Please add URL to allowed list in: Tools->Options->Expert Advisors");
          Print("Add: http://127.0.0.1, http://localhost");
+         mlConsecutiveFailures++;
+         return 0;
       }
+
+      Print("WebRequest attempt ", attempt, "/", maxRetries, " failed (error ", last_error, ")");
+      if(attempt < maxRetries)
+         Sleep(1000);  // 1 second backoff before retry
+   }
+
+   if(res == -1)
+   {
+      mlConsecutiveFailures++;
+      Print("ML API failed after ", maxRetries, " retries (consecutive failures: ", mlConsecutiveFailures, ")");
       return 0;
    }
-   
+
+   // Reset failure counter on success
+   mlConsecutiveFailures = 0;
+
    string response = CharArrayToString(result_data);
    Print("API Response: ", response);
    
@@ -632,7 +677,8 @@ void OpenTrade(ENUM_ORDER_TYPE orderType)
                   SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double slDistance = atr[0] * ATR_Multiplier;
+   double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * point;
+   double slDistance = atr[0] * ATR_Multiplier + spread;
    double tpDistance = atr[0] * ATR_Multiplier * 2.0;
    
    double sl = (orderType == ORDER_TYPE_BUY) ? price - slDistance : price + slDistance;
@@ -707,22 +753,20 @@ double CalculateLotSize(double slDistance)
    
    lotSize = NormalizeDouble(lotSize, 2);
    
-   // Safety check for margin
+   // Safety check for margin — cap at 50% of free margin
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   double marginRequired = 0.0;
-   
-   // Calculate approximate margin required for this lot size
    double margin_per_lot = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
-   if(margin_per_lot > 0)
-      marginRequired = lotSize * margin_per_lot;
-   
-   // Use max 50% of free margin
-   if(marginRequired > freeMargin * 0.5 && freeMargin > 0)
+
+   if(margin_per_lot > 0 && freeMargin > 0)
    {
-      Print("Reducing lot size due to margin constraints");
-      lotSize = MathMin(lotSize, freeMargin * 0.5 / marginRequired * lotSize);
-      lotSize = MathFloor(lotSize / lotStep) * lotStep;
-      lotSize = NormalizeDouble(lotSize, 2);
+      double maxLotByMargin = (freeMargin * 0.5) / margin_per_lot;
+      if(lotSize > maxLotByMargin)
+      {
+         Print("Reducing lot size due to margin constraints: ", lotSize, " -> ", maxLotByMargin);
+         lotSize = maxLotByMargin;
+         lotSize = MathFloor(lotSize / lotStep) * lotStep;
+         lotSize = NormalizeDouble(lotSize, 2);
+      }
    }
    
    return lotSize;
