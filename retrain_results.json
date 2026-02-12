@@ -1,0 +1,46 @@
+{
+  "new_metrics": {
+    "label": "NEW",
+    "accuracy": 0.7322467986030268,
+    "f1_macro": 0.5079298518119046,
+    "f1_sell": 0.3333333333333333,
+    "f1_range": 0.8389249304911955,
+    "f1_buy": 0.35153129161118507,
+    "total_trades": 994,
+    "win_rate": 0.6619718309859155,
+    "avg_trade_return": 0.00010085007257015805,
+    "sharpe": 2.6637885789132105,
+    "max_drawdown": -0.007487772092955813
+  },
+  "old_metrics": null,
+  "features_used": [
+    "close_ema50_h1",
+    "ema50_ema200_h1",
+    "rsi_h1",
+    "rsi_slope_h1",
+    "atr_ratio_h1",
+    "body_h1",
+    "range_h1",
+    "hour",
+    "session_asian",
+    "session_european",
+    "session_american",
+    "dow_monday",
+    "dow_tuesday",
+    "dow_wednesday",
+    "dow_thursday",
+    "dow_friday",
+    "ema50_ema200_h4",
+    "rsi_h4",
+    "rsi_slope_h4",
+    "atr_ratio_h4",
+    "dm_momentum_h4",
+    "body_h4",
+    "range_h4"
+  ],
+  "class_distribution": {
+    "sell": 0.07982068001863064,
+    "range": 0.8386702375407545,
+    "buy": 0.0815090824406148
+  }
+}

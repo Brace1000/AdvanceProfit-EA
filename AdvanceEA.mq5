@@ -14,7 +14,7 @@
 input group "=== ML API Settings ==="
 input bool   UseMLPredictions = true;        // Use ML predictions
 input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
-input double ML_Confidence_Threshold = 0.40; // Minimum confidence (40%)
+input double ML_Confidence_Threshold = 0.50; // Minimum confidence (50%)
 input bool   CombineWithTechnical = false;    // Combine ML with technical signals
 
 input group "=== Risk Management ==="
@@ -59,8 +59,8 @@ CAccountInfo accInfo;
 int handleMA_Fast, handleMA_Slow, handleRSI, handleATR, handleTrendMA;
 
 // ML indicator handles (H1 + H4)
-int handleEMA50_H1, handleEMA200_H1, handleADX_H1, handleRSI_H1, handleATR_H1;
-int handleEMA50_H4, handleEMA200_H4, handleADX_H4, handleRSI_H4, handleATR_H4;
+int handleEMA50_H1, handleEMA200_H1, handleRSI_H1, handleATR_H1;
+int handleEMA50_H4, handleEMA200_H4, handleRSI_H4, handleATR_H4;
 
 double dailyStartBalance;
 datetime lastBarTime;
@@ -92,13 +92,11 @@ int OnInit()
    // ML-specific indicators (H1 and H4 timeframes)
    handleEMA50_H1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
    handleEMA200_H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
-   handleADX_H1 = iADX(_Symbol, PERIOD_H1, 14);
    handleRSI_H1 = iRSI(_Symbol, PERIOD_H1, RSI_Period, PRICE_CLOSE);
    handleATR_H1 = iATR(_Symbol, PERIOD_H1, ATR_Period);
 
    handleEMA50_H4 = iMA(_Symbol, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
    handleEMA200_H4 = iMA(_Symbol, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE);
-   handleADX_H4 = iADX(_Symbol, PERIOD_H4, 14);
    handleRSI_H4 = iRSI(_Symbol, PERIOD_H4, RSI_Period, PRICE_CLOSE);
    handleATR_H4 = iATR(_Symbol, PERIOD_H4, ATR_Period);
    
@@ -106,9 +104,9 @@ int OnInit()
       handleRSI == INVALID_HANDLE || handleATR == INVALID_HANDLE || 
       handleTrendMA == INVALID_HANDLE ||
       handleEMA50_H1 == INVALID_HANDLE || handleEMA200_H1 == INVALID_HANDLE ||
-      handleADX_H1 == INVALID_HANDLE || handleRSI_H1 == INVALID_HANDLE || handleATR_H1 == INVALID_HANDLE ||
+      handleRSI_H1 == INVALID_HANDLE || handleATR_H1 == INVALID_HANDLE ||
       handleEMA50_H4 == INVALID_HANDLE || handleEMA200_H4 == INVALID_HANDLE ||
-      handleADX_H4 == INVALID_HANDLE || handleRSI_H4 == INVALID_HANDLE || handleATR_H4 == INVALID_HANDLE)
+      handleRSI_H4 == INVALID_HANDLE || handleATR_H4 == INVALID_HANDLE)
    {
       Print("Error initializing indicators!");
       return(INIT_FAILED);
@@ -143,13 +141,11 @@ void OnDeinit(const int reason)
 
    IndicatorRelease(handleEMA50_H1);
    IndicatorRelease(handleEMA200_H1);
-   IndicatorRelease(handleADX_H1);
    IndicatorRelease(handleRSI_H1);
    IndicatorRelease(handleATR_H1);
 
    IndicatorRelease(handleEMA50_H4);
    IndicatorRelease(handleEMA200_H4);
-   IndicatorRelease(handleADX_H4);
    IndicatorRelease(handleRSI_H4);
    IndicatorRelease(handleATR_H4);
    
@@ -210,22 +206,20 @@ int GetMLPrediction(double &confidence)
    }
 
    // H1 indicator buffers
-   double ema50_h1[2], ema200_h1[2], rsi_h1[2], atr_h1[2], adx_h1[2];
+   double ema50_h1[2], ema200_h1[2], rsi_h1[2], atr_h1[2];
    double close_h1[3], open_h1[2], high_h1[2], low_h1[2];
 
    // H4 indicator buffers
-   double ema50_h4[2], ema200_h4[2], rsi_h4[2], atr_h4[2], adx_h4[2];
-   double close_h4[3], open_h4[2], high_h4[2], low_h4[2];
-   
+   double ema50_h4[2], ema200_h4[2], rsi_h4[2], atr_h4[2];
+   double close_h4[3], open_h4[2], high_h4[15], low_h4[15];  // 15 bars for DM momentum
+
    ArraySetAsSeries(ema50_h1, true); ArraySetAsSeries(ema200_h1, true);
    ArraySetAsSeries(rsi_h1, true);   ArraySetAsSeries(atr_h1, true);
-   ArraySetAsSeries(adx_h1, true);
    ArraySetAsSeries(close_h1, true); ArraySetAsSeries(open_h1, true);
    ArraySetAsSeries(high_h1, true);  ArraySetAsSeries(low_h1, true);
 
    ArraySetAsSeries(ema50_h4, true); ArraySetAsSeries(ema200_h4, true);
    ArraySetAsSeries(rsi_h4, true);   ArraySetAsSeries(atr_h4, true);
-   ArraySetAsSeries(adx_h4, true);
    ArraySetAsSeries(close_h4, true); ArraySetAsSeries(open_h4, true);
    ArraySetAsSeries(high_h4, true);  ArraySetAsSeries(low_h4, true);
    
@@ -233,8 +227,7 @@ int GetMLPrediction(double &confidence)
    if(CopyBuffer(handleEMA50_H1, 0, 0, 2, ema50_h1) < 2 ||
       CopyBuffer(handleEMA200_H1, 0, 0, 2, ema200_h1) < 2 ||
       CopyBuffer(handleRSI_H1, 0, 0, 2, rsi_h1) < 2 ||
-      CopyBuffer(handleATR_H1, 0, 0, 2, atr_h1) < 2 ||
-      CopyBuffer(handleADX_H1, 0, 0, 2, adx_h1) < 2)
+      CopyBuffer(handleATR_H1, 0, 0, 2, atr_h1) < 2)
    {
       Print("Failed to copy H1 indicator data for ML");
       return 0;
@@ -253,29 +246,28 @@ int GetMLPrediction(double &confidence)
    if(CopyBuffer(handleEMA50_H4, 0, 0, 2, ema50_h4) < 2 ||
       CopyBuffer(handleEMA200_H4, 0, 0, 2, ema200_h4) < 2 ||
       CopyBuffer(handleRSI_H4, 0, 0, 2, rsi_h4) < 2 ||
-      CopyBuffer(handleATR_H4, 0, 0, 2, atr_h4) < 2 ||
-      CopyBuffer(handleADX_H4, 0, 0, 2, adx_h4) < 2)
+      CopyBuffer(handleATR_H4, 0, 0, 2, atr_h4) < 2)
    {
       Print("Failed to copy H4 indicator data for ML");
       return 0;
    }
-   // Copy H4 prices
+   // Copy H4 prices (15 bars of high/low needed for 14-period DM momentum)
    if(CopyClose(_Symbol, PERIOD_H4, 0, 3, close_h4) < 3 ||
       CopyOpen(_Symbol, PERIOD_H4, 0, 2, open_h4) < 2 ||
-      CopyHigh(_Symbol, PERIOD_H4, 0, 2, high_h4) < 2 ||
-      CopyLow(_Symbol, PERIOD_H4, 0, 2, low_h4) < 2)
+      CopyHigh(_Symbol, PERIOD_H4, 0, 15, high_h4) < 15 ||
+      CopyLow(_Symbol, PERIOD_H4, 0, 15, low_h4) < 15)
    {
       Print("Failed to copy H4 price data for ML");
       return 0;
    }
 
-   // Compute H1 features (excluding adx_h1 - pruned due to correlation with atr_ratio_h1)
+   // Compute H1 features (excluding dm_momentum_h1 - pruned due to correlation with atr_ratio_h1)
    double close_ema50_h1 = ema50_h1[0];
    double ema50_ema200_h1 = ema50_h1[0] - ema200_h1[0];
    double rsi_val_h1 = rsi_h1[0];
    double rsi_slope_h1 = rsi_h1[0] - rsi_h1[1];
    double atr_ratio_h1 = atr_h1[0] / close_h1[0];
-   // double adx_val_h1 = adx_h1[0]; // PRUNED: corr=0.880 with atr_ratio_h1
+   // dm_momentum_h1: PRUNED (corr=0.880 with atr_ratio_h1)
    double body_h1 = close_h1[0] - open_h1[0];
    double range_h1 = high_h1[0] - low_h1[0];
    
@@ -316,7 +308,18 @@ int GetMLPrediction(double &confidence)
    double rsi_val_h4 = rsi_h4[0];
    double rsi_slope_h4 = rsi_h4[0] - rsi_h4[1];
    double atr_ratio_h4 = atr_h4[0] / close_h4[0];
-   double adx_val_h4 = adx_h4[0];
+
+   // DM momentum: abs(+DM - -DM) averaged over 14 bars
+   // Matches Python: (plus_dm - minus_dm).abs().rolling(14).mean()
+   double dm_sum = 0;
+   for(int i = 0; i < 14; i++)
+   {
+      double plus_dm = MathMax(high_h4[i] - high_h4[i+1], 0.0);
+      double minus_dm = MathMax(low_h4[i+1] - low_h4[i], 0.0);
+      dm_sum += MathAbs(plus_dm - minus_dm);
+   }
+   double dm_momentum_h4 = dm_sum / 14.0;
+
    double body_h4 = close_h4[0] - open_h4[0];
    double range_h4 = high_h4[0] - low_h4[0];
 
@@ -331,7 +334,7 @@ int GetMLPrediction(double &confidence)
       !MathIsValidNumber(range_h1) ||
       !MathIsValidNumber(ema50_ema200_h4) || !MathIsValidNumber(rsi_val_h4) ||
       !MathIsValidNumber(rsi_slope_h4) || !MathIsValidNumber(atr_ratio_h4) ||
-      !MathIsValidNumber(adx_val_h4) || !MathIsValidNumber(body_h4) ||
+      !MathIsValidNumber(dm_momentum_h4) || !MathIsValidNumber(body_h4) ||
       !MathIsValidNumber(range_h4))
    {
       Print("Feature validation failed: one or more features are NaN/Inf");
@@ -349,10 +352,10 @@ int GetMLPrediction(double &confidence)
    }
 
    // Build JSON request with 23 features (after correlation pruning) in exact order expected by Python
-   // Pruned features: close_ema50_h4, adx_h1, prev_return_h1, prev_return_h4
+   // Pruned features: close_ema50_h4, dm_momentum_h1, prev_return_h1, prev_return_h4
    string features = StringFormat(
-      "[%.6f,%.6f,%.4f,%.6f,%.8f,%.8f,%.8f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.6f,%.4f,%.6f,%.8f,%.4f,%.8f,%.8f]",
-      // H1 features (7): excluded adx_h1
+      "[%.6f,%.6f,%.4f,%.6f,%.8f,%.8f,%.8f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.6f,%.4f,%.6f,%.8f,%.8f,%.8f,%.8f]",
+      // H1 features (7): excluded dm_momentum_h1
       close_ema50_h1, ema50_ema200_h1, rsi_val_h1, rsi_slope_h1,
       atr_ratio_h1, body_h1, range_h1,
       // Time features (9): hour + 3 sessions + 5 days
@@ -360,7 +363,7 @@ int GetMLPrediction(double &confidence)
       dow_monday, dow_tuesday, dow_wednesday, dow_thursday, dow_friday,
       // H4 features (7): excluded close_ema50_h4
       ema50_ema200_h4, rsi_val_h4, rsi_slope_h4,
-      atr_ratio_h4, adx_val_h4, body_h4, range_h4
+      atr_ratio_h4, dm_momentum_h4, body_h4, range_h4
       // Excluded: prev_return_h1, prev_return_h4
    );
    

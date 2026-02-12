@@ -19,10 +19,10 @@ class FeatureEngineer:
     Features are calculated on both H1 data and resampled H4 data.
 
     20 Features total:
-    - H1: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, adx, body, range
+    - H1: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, dm_momentum, body, range
     - hour, session (time-based)
     - prev_return_h1
-    - H4: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, adx, body, range
+    - H4: close_ema50, ema50_ema200, rsi, rsi_slope, atr_ratio, dm_momentum, body, range
     - prev_return_h4
     """
 
@@ -98,7 +98,7 @@ class FeatureEngineer:
         df = self._ema(df, suffix)
         df = self._rsi(df, suffix)
         df = self._atr(df, suffix)
-        df = self._adx_like(df, suffix)
+        df = self._dm_momentum(df, suffix)
         df = self._candle(df, suffix)
         df = self._returns(df, suffix)
         return df
@@ -196,11 +196,17 @@ class FeatureEngineer:
         df[f"atr_ratio{suffix}"] = df[f"atr{suffix}"] / (df["close"] + 1e-10)
         return df
 
-    def _adx_like(self, df: pd.DataFrame, suffix: str = "", period: int = 14) -> pd.DataFrame:
-        """Calculate simplified ADX-like indicator."""
+    def _dm_momentum(self, df: pd.DataFrame, suffix: str = "", period: int = 14) -> pd.DataFrame:
+        """
+        Calculate directional movement momentum.
+
+        This is NOT Wilder's ADX. It is abs(+DM - -DM) smoothed over `period` bars.
+        The MQL5 EA computes the identical formula from raw H4 price bars,
+        ensuring training/inference parity (MQL5's iADX is NOT used).
+        """
         df[f"plus_dm{suffix}"] = df["high"].diff().clip(lower=0)
         df[f"minus_dm{suffix}"] = (-df["low"].diff()).clip(lower=0)
-        df[f"adx{suffix}"] = (df[f"plus_dm{suffix}"] - df[f"minus_dm{suffix}"]).abs().rolling(period).mean()
+        df[f"dm_momentum{suffix}"] = (df[f"plus_dm{suffix}"] - df[f"minus_dm{suffix}"]).abs().rolling(period).mean()
         return df
 
     def _candle(self, df: pd.DataFrame, suffix: str = "") -> pd.DataFrame:
@@ -228,7 +234,7 @@ class FeatureEngineer:
             "rsi_h1",
             "rsi_slope_h1",
             "atr_ratio_h1",
-            "adx_h1",
+            "dm_momentum_h1",
             "body_h1",
             "range_h1",
             # Time features (9): hour + 3 sessions + 5 days
@@ -249,7 +255,7 @@ class FeatureEngineer:
             "rsi_h4",
             "rsi_slope_h4",
             "atr_ratio_h4",
-            "adx_h4",
+            "dm_momentum_h4",
             "body_h4",
             "range_h4",
             # H4 return (1)
