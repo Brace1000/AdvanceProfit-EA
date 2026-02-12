@@ -285,13 +285,17 @@ int GetMLPrediction(double &confidence)
    else
       session_american = 1;
 
-   // One-hot encode day of week (5 binary features: Monday=1, Friday=5)
+   // One-hot encode day of week (5 binary features)
+   // MQL5 day_of_week: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+   // Python dayofweek:         0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+   // Remap: python_dow = (mql5_dow + 6) % 7  →  Sun→6, Mon→0, Tue→1, Wed→2, Thu→3, Fri→4, Sat→5
+   int python_dow = (now.day_of_week + 6) % 7;
    double dow_monday = 0, dow_tuesday = 0, dow_wednesday = 0, dow_thursday = 0, dow_friday = 0;
-   if(now.day_of_week == 1) dow_monday = 1;
-   else if(now.day_of_week == 2) dow_tuesday = 1;
-   else if(now.day_of_week == 3) dow_wednesday = 1;
-   else if(now.day_of_week == 4) dow_thursday = 1;
-   else if(now.day_of_week == 5) dow_friday = 1;
+   if(python_dow == 0) dow_monday = 1;
+   else if(python_dow == 1) dow_tuesday = 1;
+   else if(python_dow == 2) dow_wednesday = 1;
+   else if(python_dow == 3) dow_thursday = 1;
+   else if(python_dow == 4) dow_friday = 1;
 
    // double prev_return_h1 = 0.0; // PRUNED: corr=0.957 with body_h1
    // if(close_h1[1] != 0.0)
@@ -446,29 +450,22 @@ int GetTradeSignal()
       }
    }
    
-   // If combining ML with technical (CombineWithTechnical = true)
+   // Strict agreement: trade ONLY if ml_signal == tech_signal AND confidence >= threshold
    if(CombineWithTechnical)
    {
       int tech_signal = GetTechnicalSignal();
-      
+
       if(ml_signal == tech_signal && ml_signal != 0 && ml_confidence >= ML_Confidence_Threshold)
       {
          Print("✓ ML and Technical signals agree: ", ml_signal == 1 ? "BUY" : "SELL");
          return ml_signal;
       }
-      else if(tech_signal != 0 && ml_confidence < ML_Confidence_Threshold)
-      {
-         Print("✗ ML confidence too low, using technical signal: ", tech_signal == 1 ? "BUY" : "SELL");
-         return tech_signal;
-      }
-      else
-      {
-         Print("✗ ML and Technical signals disagree - no trade");
-         Print("  ML: ", ml_signal == 1 ? "BUY" : (ml_signal == -1 ? "SELL" : "NONE"), 
-               " (Confidence: ", DoubleToString(ml_confidence*100, 1), "%)");
-         Print("  Technical: ", tech_signal == 1 ? "BUY" : (tech_signal == -1 ? "SELL" : "NONE"));
-         return 0;
-      }
+
+      Print("✗ No trade - strict agreement not met");
+      Print("  ML: ", ml_signal == 1 ? "BUY" : (ml_signal == -1 ? "SELL" : "NONE"),
+            " (Confidence: ", DoubleToString(ml_confidence*100, 1), "%)");
+      Print("  Technical: ", tech_signal == 1 ? "BUY" : (tech_signal == -1 ? "SELL" : "NONE"));
+      return 0;
    }
    
    return 0;
@@ -846,8 +843,9 @@ void ManageTrailingStops()
 //+------------------------------------------------------------------+
 bool CheckDailyLimits()
 {
-   double currentBalance = accInfo.Balance();
-   dailyProfitLoss = currentBalance - dailyStartBalance;
+   // Use Equity() (not Balance()) to detect drawdown from floating open positions
+   double currentEquity = accInfo.Equity();
+   dailyProfitLoss = currentEquity - dailyStartBalance;
    double dailyPL_Percent = 0;
    
    if(dailyStartBalance > 0)
