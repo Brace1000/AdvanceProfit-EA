@@ -428,25 +428,66 @@ int GetMLPrediction(double &confidence)
 
    string response = CharArrayToString(result_data);
    Print("API Response: ", response);
-   
+
+   // Structural validation: check HTTP status code
+   if(res != 200)
+   {
+      Print("API returned HTTP ", res, " — expected 200");
+      if(StringFind(response, "Expected") >= 0)
+         Print("Likely feature count mismatch — check feature_contract.json");
+      return 0;
+   }
+
    // Extract prediction and confidence
    double sell_prob = ExtractValue(response, "sell");
    double range_prob = ExtractValue(response, "range");
    double buy_prob = ExtractValue(response, "buy");
    confidence = ExtractValue(response, "confidence");
-   
+
    string prediction = ExtractStringValue(response, "prediction");
-   
+
+   // Structural validation: all required keys must be present
+   if(StringFind(response, "\"sell\"") < 0 || StringFind(response, "\"range\"") < 0 ||
+      StringFind(response, "\"buy\"") < 0 || StringFind(response, "\"confidence\"") < 0 ||
+      StringFind(response, "\"prediction\"") < 0)
+   {
+      Print("Response validation failed: missing required keys (sell/range/buy/confidence/prediction)");
+      return 0;
+   }
+
+   // Structural validation: probabilities must sum to ~1.0 (tolerance 0.05)
+   double prob_sum = sell_prob + range_prob + buy_prob;
+   if(MathAbs(prob_sum - 1.0) > 0.05)
+   {
+      Print("Response validation failed: probabilities sum to ", DoubleToString(prob_sum, 4),
+            " (expected ~1.0). sell=", sell_prob, " range=", range_prob, " buy=", buy_prob);
+      return 0;
+   }
+
+   // Structural validation: prediction must be a known class
+   if(prediction != "buy" && prediction != "sell" && prediction != "range")
+   {
+      Print("Response validation failed: unknown prediction '", prediction, "'");
+      return 0;
+   }
+
+   // Structural validation: confidence must be in [0, 1]
+   if(confidence < 0.0 || confidence > 1.0)
+   {
+      Print("Response validation failed: confidence=", confidence, " out of [0,1]");
+      return 0;
+   }
+
    Print("ML Prediction: ", prediction, " (Confidence: ", DoubleToString(confidence*100, 1), "%)");
-   Print("  Sell: ", DoubleToString(sell_prob*100, 1), "% | Range: ", 
+   Print("  Sell: ", DoubleToString(sell_prob*100, 1), "% | Range: ",
          DoubleToString(range_prob*100, 1), "% | Buy: ", DoubleToString(buy_prob*100, 1), "%");
-   
+
    if(confidence < ML_Confidence_Threshold)
    {
       Print("ML confidence too low, skipping trade");
       return 0;
    }
-   
+
    if(prediction == "buy")
       return 1;
    else if(prediction == "sell")

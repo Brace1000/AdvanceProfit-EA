@@ -1,5 +1,6 @@
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import joblib
 import numpy as np
@@ -15,11 +16,36 @@ logger = get_logger("trading_bot.api")
 model = None
 expected_n_features: Optional[int] = None
 feature_names: Optional[list[str]] = None
+feature_contract: Optional[Dict[str, Any]] = None
+
+CONTRACT_PATH = Path("feature_contract.json")
+
+
+def _load_contract() -> Optional[Dict[str, Any]]:
+    """Load feature contract from JSON file."""
+    if not CONTRACT_PATH.exists():
+        logger.warning(f"Feature contract not found at {CONTRACT_PATH}")
+        return None
+    try:
+        return json.loads(CONTRACT_PATH.read_text())
+    except Exception as e:
+        logger.error(f"Failed to parse feature contract: {e}")
+        return None
 
 
 @app.on_event("startup")
 async def load_model():
-    global model, expected_n_features, feature_names
+    global model, expected_n_features, feature_names, feature_contract
+
+    # Load feature contract (single source of truth)
+    feature_contract = _load_contract()
+    if feature_contract is not None:
+        expected_n_features = feature_contract["feature_count"]
+        feature_names = feature_contract["features"]
+        logger.info(
+            f"Feature contract v{feature_contract['version']} loaded: "
+            f"{expected_n_features} features"
+        )
 
     cfg = get_config()
     model_path = Path(cfg.get("model.path", "xgb_eurusd_h1.pkl"))
@@ -31,17 +57,18 @@ async def load_model():
     model = joblib.load(model_path)
     logger.info(f"Model loaded from {model_path}")
 
-    if hasattr(model, "n_features_in_"):
+    # Cross-check: model feature count must match contract
+    if hasattr(model, "n_features_in_") and feature_contract is not None:
+        model_n = int(model.n_features_in_)
+        contract_n = feature_contract["feature_count"]
+        if model_n != contract_n:
+            logger.error(
+                f"MISMATCH: model expects {model_n} features but contract specifies {contract_n}"
+            )
+    elif hasattr(model, "n_features_in_") and feature_contract is None:
+        # Fallback: use model's own feature count if no contract
         expected_n_features = int(model.n_features_in_)
-        logger.info(f"Expected number of features: {expected_n_features}")
-
-    names_path = Path("feature_names.json")
-    if names_path.exists():
-        try:
-            import json
-            feature_names = json.loads(names_path.read_text())
-        except Exception:
-            feature_names = None
+        logger.info(f"No contract; using model feature count: {expected_n_features}")
 
 
 class PredictionRequest(BaseModel):
@@ -62,7 +89,7 @@ def root():
         "model_loaded": model is not None,
         "expected_n_features": expected_n_features,
         "feature_names": feature_names,
-        "endpoints": {"/predict": "POST", "/health": "GET"},
+        "endpoints": {"/predict": "POST", "/health": "GET", "/contract": "GET"},
     }
 
 
@@ -78,6 +105,21 @@ def health():
     }
 
 
+@app.get("/contract")
+def contract():
+    """Return the feature contract — single source of truth for feature vector."""
+    if feature_contract is None:
+        raise HTTPException(status_code=503, detail="Feature contract not loaded")
+    return {
+        "version": feature_contract["version"],
+        "feature_count": feature_contract["feature_count"],
+        "feature_names": feature_contract["features"],
+        "label_mapping": feature_contract.get("label_mapping"),
+        "prediction_mapping": feature_contract.get("prediction_mapping"),
+        "confidence_threshold": feature_contract.get("confidence_threshold"),
+    }
+
+
 @app.post("/predict")
 def predict(request: PredictionRequest):
     if model is None:
@@ -87,8 +129,10 @@ def predict(request: PredictionRequest):
     if expected_n_features is not None and len(features) != expected_n_features:
         raise HTTPException(
             status_code=400,
-            detail=f"Expected {expected_n_features} features, got {len(features)}."
-                   + (f" Names: {feature_names}" if feature_names else ""),
+            detail={
+                "error": f"Expected {expected_n_features} features, got {len(features)}",
+                "expected_features": feature_names,
+            },
         )
 
     try:
