@@ -35,7 +35,7 @@ model:
     - rsi_h1
     - rsi_slope_h1
     - atr_ratio_h1
-    - adx_h1
+    - dm_momentum_h1
     - body_h1
     - range_h1
     # Time features (9): hour + 3 sessions + 5 days
@@ -56,7 +56,7 @@ model:
     - rsi_h4
     - rsi_slope_h4
     - atr_ratio_h4
-    - adx_h4
+    - dm_momentum_h4
     - body_h4
     - range_h4
     # H4 return (1)
@@ -81,8 +81,8 @@ training:
   # Remaining 20% is holdout (never touched until final evaluation)
 
   # Label thresholds for classification
-  buy_threshold: 0.0005   # Return > 0.05% = Buy signal
-  sell_threshold: -0.0005 # Return < -0.05% = Sell signal
+  buy_threshold: 0.001    # Return > 0.1% = Buy signal
+  sell_threshold: -0.001  # Return < -0.1% = Sell signal
 
   # Feature selection
   correlation_threshold: 0.85  # Drop features with Spearman correlation > 0.85
@@ -126,8 +126,9 @@ trading:
   # ML Settings
   ml:
     use_predictions: true
-    confidence_threshold: 0.40
+    confidence_threshold: 0.80
     combine_with_technical: false  # true = ML + Technical, false = ML only
+    model_staleness_hours: 168  # Warn after 7 days
 
   # Position Management
   position:

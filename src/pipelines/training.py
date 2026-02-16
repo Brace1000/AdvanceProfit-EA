@@ -266,10 +266,20 @@ class TrainingPipeline:
         # 3-way split
         X_train, X_val, X_holdout, y_train, y_val, y_holdout = self._three_way_split(X, y)
 
-        # HPO on train set, validated on validation set
+        # Extract validation close prices for Stage 2 Sharpe selection
+        train_ratio = float(self._get("training.train_ratio", 0.6))
+        val_ratio = float(self._get("training.val_ratio", 0.2))
+        n = len(df)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+        close_val = df["close"].values[train_end:val_end]
+
+        # HPO on train set, validated on validation set (two-stage: F1 then Sharpe)
         if bool(self._get("hpo.enabled", True)):
-            logger.info("Running hyperparameter optimization...")
-            best_params, best_val = hpo_optimize(X_train, y_train, X_val, y_val, self.config)
+            logger.info("Running two-stage hyperparameter optimization...")
+            best_params, best_val = hpo_optimize(
+                X_train, y_train, X_val, y_val, self.config, close_val=close_val
+            )
             self.config.setdefault("model", {}).setdefault("params", {}).update(best_params)
             logger.info(f"HPO complete. Best validation F1: {best_val:.4f}")
 

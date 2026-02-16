@@ -27,7 +27,6 @@ ENV/
 .venv
 
 # Poetry
-poetry.lock
 .poetry/
 
 # IDEs
@@ -106,4 +105,6 @@ bfg.jar
 
 
 
-*.xgb_eurusd_h1.pkl
+*.pkl
+
+__pycache__
