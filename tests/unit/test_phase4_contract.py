@@ -124,14 +124,22 @@ class TestContractEndpoint:
 
     @pytest.fixture(scope="class")
     def client(self):
+        from unittest.mock import MagicMock
         from fastapi.testclient import TestClient
         from main import app, _load_contract
-        # Manually trigger startup state for testing
         import main as main_mod
+
+        # Load contract
         main_mod.feature_contract = _load_contract()
         if main_mod.feature_contract:
             main_mod.expected_n_features = main_mod.feature_contract["feature_count"]
             main_mod.feature_names = main_mod.feature_contract["features"]
+
+        # Inject a stub model so /predict reaches the feature-count check
+        stub = MagicMock()
+        stub.n_features_in_ = main_mod.expected_n_features
+        main_mod.model = stub
+
         return TestClient(app)
 
     def test_contract_returns_200(self, client):
