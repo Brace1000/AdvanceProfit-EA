@@ -126,7 +126,7 @@ trading:
   # ML Settings
   ml:
     use_predictions: true
-    confidence_threshold: 0.50
+    confidence_threshold: 0.80
     combine_with_technical: false  # true = ML + Technical, false = ML only
     model_staleness_hours: 168  # Warn after 7 days
 

@@ -17,7 +17,7 @@ input group "=== ML API Settings ==="
 input bool   UseMLPredictions = true;        // Use ML predictions
 input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
 input string API_HEALTH_URL = "http://127.0.0.1:8000/health"; // Health endpoint
-input double ML_Confidence_Threshold = 0.50; // Minimum confidence (50%)
+input double ML_Confidence_Threshold = 0.80; // Minimum confidence (80%) — calibration verified above this level
 input bool   CombineWithTechnical = false;    // Combine ML with technical signals
 input double ModelStalenessHours = 168;       // Model staleness threshold (hours)
 
@@ -72,6 +72,13 @@ int totalTradesToday = 0;
 double dailyProfitLoss = 0.0;
 int mlConsecutiveFailures = 0;            // API failure counter
 const int ML_MAX_CONSECUTIVE_FAILURES = 5; // Auto-disable ML after this many
+
+// Runtime ML toggle — safe to modify (input var is read-only after init)
+bool g_UseML = true;
+
+// Partial-close tracking — prevent cascade closures on consecutive ticks
+ulong partialClosedTickets[];
+int partialClosedCount = 0;
 
 // Trade logging
 int tradeLogHandle = INVALID_HANDLE;
@@ -130,8 +137,11 @@ int OnInit()
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
 
+   // Copy input to runtime variable (input vars are read-only after init in MQL5)
+   g_UseML = UseMLPredictions;
+
    // Health check: verify API availability and model freshness
-   if(UseMLPredictions)
+   if(g_UseML)
       CheckAPIHealth();
 
    // Open trade log CSV
@@ -153,7 +163,7 @@ int OnInit()
       Print("WARNING: Could not open trade log file");
    }
 
-   Print("ML Integration: ", UseMLPredictions ? "ENABLED" : "DISABLED");
+   Print("ML Integration: ", g_UseML ? "ENABLED" : "DISABLED");
    Print("API URL: ", API_URL);
    Print("ML Confidence Threshold: ", ML_Confidence_Threshold);
    Print("Risk per trade: ", RiskPercent, "%");
@@ -195,30 +205,33 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Check daily limits on EVERY tick — prevents intra-bar equity collapse
+   if(!CheckDailyLimits())
+   {
+      CloseAllPositions("Daily limit reached");
+      return;
+   }
+
    datetime currentBarTime = iTime(_Symbol, _Period, 0);
    bool isNewBar = (currentBarTime != lastBarTime);
-   
+
    if(isNewBar)
    {
       lastBarTime = currentBarTime;
-      
+
       CheckDailyReset();
-      
-      if(!CheckDailyLimits())
-      {
-         CloseAllPositions("Daily limit reached");
-         return;
-      }
-      
+
+      // Breakeven / partial close FIRST, then trailing stops
+      // (prevents conflicting SL targets from double PositionModify)
+      ManagePositions();
+
       if(UseTrailingStop)
          ManageTrailingStops();
-      
-      ManagePositions();
-      
+
       if(CountOpenPositions() < MaxSimultaneousTrades)
       {
          int signal = GetTradeSignal();
-         
+
          if(signal == 1)
             OpenTrade(ORDER_TYPE_BUY);
          else if(signal == -1)
@@ -232,8 +245,13 @@ void OnTick()
 //+------------------------------------------------------------------+
 int GetMLPrediction(double &confidence)
 {
-   if(!UseMLPredictions)
+   if(!g_UseML)
       return 0;
+
+   // Clear stale values — only set after validation passes
+   lastMLPrediction = "";
+   lastMLConfidence = 0;
+   lastFeaturesHash = "";
 
    // Auto-disable ML after too many consecutive API failures
    if(mlConsecutiveFailures >= ML_MAX_CONSECUTIVE_FAILURES)
@@ -415,10 +433,10 @@ int GetMLPrediction(double &confidence)
 
    StringToCharArray(json_request, post_data, 0, StringLen(json_request));
 
-   int timeout = 5000; // 5 seconds
+   int timeout = 2000; // 2 seconds (reduced from 5s to limit signal latency)
    string headers = "Content-Type: application/json\r\n";
    int res = -1;
-   int maxRetries = 3;
+   int maxRetries = 2;  // 2 retries (worst-case 6s, reduced from 18s)
 
    for(int attempt = 1; attempt <= maxRetries; attempt++)
    {
@@ -485,10 +503,6 @@ int GetMLPrediction(double &confidence)
 
    string prediction = ExtractStringValue(response, "prediction");
 
-   // Store for trade logging
-   lastMLPrediction = prediction;
-   lastMLConfidence = confidence;
-
    // Structural validation: all required keys must be present
    if(StringFind(response, "\"sell\"") < 0 || StringFind(response, "\"range\"") < 0 ||
       StringFind(response, "\"buy\"") < 0 || StringFind(response, "\"confidence\"") < 0 ||
@@ -520,6 +534,10 @@ int GetMLPrediction(double &confidence)
       Print("Response validation failed: confidence=", confidence, " out of [0,1]");
       return 0;
    }
+
+   // Store VALIDATED values for trade logging (after all checks pass)
+   lastMLPrediction = prediction;
+   lastMLConfidence = confidence;
 
    Print("ML Prediction: ", prediction, " (Confidence: ", DoubleToString(confidence*100, 1), "%)");
    Print("  Sell: ", DoubleToString(sell_prob*100, 1), "% | Range: ",
@@ -561,7 +579,7 @@ int GetTradeSignal()
    int ml_signal = GetMLPrediction(ml_confidence);
    
    // If not using ML at all, get technical signal
-   if(!UseMLPredictions)
+   if(!g_UseML)
    {
       lastTechSignal = GetTechnicalSignal();
       return lastTechSignal;
@@ -787,7 +805,7 @@ void OpenTrade(ENUM_ORDER_TYPE orderType)
       lotSize = minLot;
    }
    
-   string comment = UseMLPredictions ? "ML-Enhanced EA " : "Advanced EA ";
+   string comment = g_UseML ? "ML-Enhanced EA " : "Advanced EA ";
    comment += (orderType == ORDER_TYPE_BUY) ? "Buy" : "Sell";
    
    if(orderType == ORDER_TYPE_BUY)
@@ -870,6 +888,24 @@ double CalculateLotSize(double slDistance)
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
+   // Clean up partial-close tracking: remove tickets that are no longer open
+   for(int pc = partialClosedCount - 1; pc >= 0; pc--)
+   {
+      bool found = false;
+      for(int j = PositionsTotal() - 1; j >= 0; j--)
+      {
+         if(posInfo.SelectByIndex(j) && posInfo.Ticket() == partialClosedTickets[pc])
+         { found = true; break; }
+      }
+      if(!found)
+      {
+         // Remove from tracking array (swap with last element)
+         partialClosedTickets[pc] = partialClosedTickets[partialClosedCount - 1];
+         partialClosedCount--;
+         ArrayResize(partialClosedTickets, partialClosedCount);
+      }
+   }
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
@@ -885,24 +921,24 @@ void ManagePositions()
          double openPrice = posInfo.PriceOpen();
          double sl = posInfo.StopLoss();
          double profitPips = 0;
-         
+
          double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
          if(point > 0)
          {
             if(posInfo.PositionType() == POSITION_TYPE_BUY)
-               profitPips = (currentPrice - openPrice) / (point * 10); // Convert to pips (10 points per pip for 5-digit brokers)
+               profitPips = (currentPrice - openPrice) / (point * 10);
             else
                profitPips = (openPrice - currentPrice) / (point * 10);
          }
-         
+
          if(UseBreakeven && profitPips >= BreakevenTriggerPips && sl != 0)
          {
             double newSL = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                            openPrice + BreakevenOffsetPips * point * 10 :
                            openPrice - BreakevenOffsetPips * point * 10;
-            
+
             newSL = NormalizeDouble(newSL, _Digits);
-            
+
             if((posInfo.PositionType() == POSITION_TYPE_BUY && newSL > sl) ||
                (posInfo.PositionType() == POSITION_TYPE_SELL && newSL < sl))
             {
@@ -910,18 +946,35 @@ void ManagePositions()
                   Print("Position ", ticket, " moved to breakeven+", BreakevenOffsetPips, " pips");
             }
          }
-         
+
+         // Partial close: only once per ticket (prevent cascade closures)
          if(UsePartialClose && profitPips >= BreakevenTriggerPips * 2)
          {
-            double closeVolume = posInfo.Volume() * PartialClosePercent / 100.0;
-            double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-            closeVolume = MathMax(closeVolume, minLot);
-            closeVolume = NormalizeDouble(closeVolume, 2);
-            
-            if(closeVolume >= minLot && closeVolume < posInfo.Volume())
+            bool alreadyClosed = false;
+            for(int pc = 0; pc < partialClosedCount; pc++)
             {
-               if(trade.PositionClosePartial(ticket, closeVolume))
-                  Print("Partial close: ", PartialClosePercent, "% of position ", ticket, " at profit");
+               if(partialClosedTickets[pc] == ticket)
+               { alreadyClosed = true; break; }
+            }
+
+            if(!alreadyClosed)
+            {
+               double closeVolume = posInfo.Volume() * PartialClosePercent / 100.0;
+               double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+               closeVolume = MathMax(closeVolume, minLot);
+               closeVolume = NormalizeDouble(closeVolume, 2);
+
+               if(closeVolume >= minLot && closeVolume < posInfo.Volume())
+               {
+                  if(trade.PositionClosePartial(ticket, closeVolume))
+                  {
+                     Print("Partial close: ", PartialClosePercent, "% of position ", ticket, " at profit");
+                     // Track this ticket to prevent repeated partial closes
+                     partialClosedCount++;
+                     ArrayResize(partialClosedTickets, partialClosedCount);
+                     partialClosedTickets[partialClosedCount - 1] = ticket;
+                  }
+               }
             }
          }
       }
@@ -1099,7 +1152,7 @@ void CheckAPIHealth()
    {
       int err = GetLastError();
       Print("WARNING: Health check failed (error ", err, "). Proceeding without ML.");
-      UseMLPredictions = false;
+      g_UseML = false;
       return;
    }
 
@@ -1111,7 +1164,7 @@ void CheckAPIHealth()
    if(status != "healthy")
    {
       Print("WARNING: API status is '", status, "', disabling ML predictions");
-      UseMLPredictions = false;
+      g_UseML = false;
    }
 
    // Parse feature_count
@@ -1120,7 +1173,7 @@ void CheckAPIHealth()
    if(feature_count != 23)
    {
       Print("WARNING: Feature count mismatch — API reports ", feature_count, " but EA expects 23. Disabling ML.");
-      UseMLPredictions = false;
+      g_UseML = false;
    }
 
    // Parse model_age_hours for staleness check
@@ -1128,7 +1181,7 @@ void CheckAPIHealth()
    if(model_age > ModelStalenessHours * 2)
    {
       Print("CRITICAL: Model >2x stale (", DoubleToString(model_age, 1), "h old), disabling ML");
-      UseMLPredictions = false;
+      g_UseML = false;
    }
    else if(model_age > ModelStalenessHours)
    {

@@ -72,5 +72,29 @@
     "1": "range",
     "2": "buy"
   },
-  "confidence_threshold": 0.50
+  "confidence_threshold": 0.80,
+  "feature_domains": {
+    "rsi_h1": {"min": 0, "max": 100},
+    "rsi_h4": {"min": 0, "max": 100},
+    "rsi_slope_h1": {"min": -100, "max": 100},
+    "rsi_slope_h4": {"min": -100, "max": 100},
+    "hour": {"min": 0, "max": 23},
+    "atr_ratio_h1": {"min": 0, "max": 0.1},
+    "atr_ratio_h4": {"min": 0, "max": 0.1},
+    "range_h1": {"min": 0},
+    "range_h4": {"min": 0},
+    "dm_momentum_h4": {"min": 0},
+    "session_asian": {"binary": true},
+    "session_european": {"binary": true},
+    "session_american": {"binary": true},
+    "dow_monday": {"binary": true},
+    "dow_tuesday": {"binary": true},
+    "dow_wednesday": {"binary": true},
+    "dow_thursday": {"binary": true},
+    "dow_friday": {"binary": true}
+  },
+  "plausibility_rules": {
+    "exactly_one_dow": ["dow_monday", "dow_tuesday", "dow_wednesday", "dow_thursday", "dow_friday"],
+    "exactly_one_session": ["session_asian", "session_european", "session_american"]
+  }
 }

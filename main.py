@@ -141,6 +141,58 @@ def contract():
     }
 
 
+def _validate_feature_domains(features: list[float]) -> list[str]:
+    """Validate each feature against its domain from the contract."""
+    if feature_contract is None or feature_names is None:
+        return []
+    domains = feature_contract.get("feature_domains", {})
+    if not domains:
+        return []
+
+    errors = []
+    for i, (name, value) in enumerate(zip(feature_names, features)):
+        domain = domains.get(name)
+        if domain is None:
+            continue
+        if domain.get("binary"):
+            if value not in (0.0, 1.0):
+                errors.append(f"{name}[{i}]={value}: expected 0 or 1")
+            continue
+        lo = domain.get("min")
+        hi = domain.get("max")
+        if lo is not None and value < lo:
+            errors.append(f"{name}[{i}]={value}: below min {lo}")
+        if hi is not None and value > hi:
+            errors.append(f"{name}[{i}]={value}: above max {hi}")
+    return errors
+
+
+def _validate_plausibility(features: list[float]) -> list[str]:
+    """Cross-feature plausibility checks (e.g. exactly one DOW flag set)."""
+    if feature_contract is None or feature_names is None:
+        return []
+    rules = feature_contract.get("plausibility_rules", {})
+    if not rules:
+        return []
+
+    errors = []
+    name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+    for rule_name, group_names in rules.items():
+        indices = [name_to_idx[n] for n in group_names if n in name_to_idx]
+        if not indices:
+            continue
+        group_sum = sum(features[i] for i in indices)
+        if rule_name.startswith("exactly_one"):
+            if group_sum != 1.0:
+                labels = ", ".join(group_names)
+                errors.append(
+                    f"{rule_name}: expected exactly one of [{labels}] to be 1, "
+                    f"got sum={group_sum}"
+                )
+    return errors
+
+
 @app.post("/predict")
 def predict(request: PredictionRequest):
     if model is None:
@@ -166,6 +218,28 @@ def predict(request: PredictionRequest):
             detail={
                 "error": f"Expected {expected_n_features} features, got {len(features)}",
                 "expected_features": feature_names,
+            },
+        )
+
+    # Per-feature domain validation (uses contract feature_domains)
+    domain_errors = _validate_feature_domains(features)
+    if domain_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Feature domain validation failed",
+                "violations": domain_errors,
+            },
+        )
+
+    # Plausibility checks (structural constraints across features)
+    plausibility_errors = _validate_plausibility(features)
+    if plausibility_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Feature plausibility check failed",
+                "violations": plausibility_errors,
             },
         )
 
