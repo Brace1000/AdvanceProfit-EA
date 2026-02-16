@@ -1,4 +1,7 @@
 import json
+import math
+import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -97,11 +100,29 @@ def root():
 def health():
     cfg = get_config()
     model_path = cfg.get("model.path", "xgb_eurusd_h1.pkl")
+    staleness_threshold = cfg.get("trading.ml.model_staleness_hours", 168)
+    contract_version = feature_contract.get("version", "unknown") if feature_contract else "unknown"
+
+    model_loaded = model is not None
+    model_age_hours = 0.0
+
+    if Path(model_path).exists():
+        model_age_hours = (time.time() - os.path.getmtime(model_path)) / 3600
+
+    if not model_loaded:
+        status = "model_not_loaded"
+    elif model_age_hours > staleness_threshold:
+        status = "stale"
+    else:
+        status = "healthy"
+
     return {
-        "status": "healthy" if model is not None else "model_not_loaded",
+        "status": status,
+        "model_loaded": model_loaded,
+        "feature_count": expected_n_features if expected_n_features is not None else 0,
+        "model_age_hours": round(model_age_hours, 2),
         "model_path": model_path,
-        "model_exists": Path(model_path).exists(),
-        "expected_n_features": expected_n_features,
+        "contract_version": contract_version,
     }
 
 
@@ -126,6 +147,19 @@ def predict(request: PredictionRequest):
         raise HTTPException(status_code=503, detail="Model not loaded. Train model via run_all.py")
 
     features = request.features
+
+    # Reject NaN / Inf values — defense-in-depth (EA also validates, but
+    # the API must not silently pass invalid numerics to the model).
+    invalid = [i for i, v in enumerate(features) if not math.isfinite(v)]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Non-finite feature values at indices {invalid}",
+                "hint": "All features must be finite (no NaN, Inf, or -Inf)",
+            },
+        )
+
     if expected_n_features is not None and len(features) != expected_n_features:
         raise HTTPException(
             status_code=400,

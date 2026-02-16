@@ -10,12 +10,16 @@
 #include <Trade\PositionInfo.mqh>
 #include <Trade\AccountInfo.mqh>
 
+#define EA_MAGIC 123456
+
 // Input Parameters
 input group "=== ML API Settings ==="
 input bool   UseMLPredictions = true;        // Use ML predictions
 input string API_URL = "http://127.0.0.1:8000/predict"; // API endpoint
+input string API_HEALTH_URL = "http://127.0.0.1:8000/health"; // Health endpoint
 input double ML_Confidence_Threshold = 0.50; // Minimum confidence (50%)
 input bool   CombineWithTechnical = false;    // Combine ML with technical signals
+input double ModelStalenessHours = 168;       // Model staleness threshold (hours)
 
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
@@ -69,6 +73,13 @@ double dailyProfitLoss = 0.0;
 int mlConsecutiveFailures = 0;            // API failure counter
 const int ML_MAX_CONSECUTIVE_FAILURES = 5; // Auto-disable ML after this many
 
+// Trade logging
+int tradeLogHandle = INVALID_HANDLE;
+string lastMLPrediction = "";
+double lastMLConfidence = 0;
+int lastTechSignal = 0;
+string lastFeaturesHash = "";
+
 // Forward declarations for helper functions
 string StringTrimCustom(const string str);
 double StringToDoubleCustom(const string value);
@@ -115,16 +126,39 @@ int OnInit()
    dailyStartBalance = accInfo.Balance();
    lastBarTime = 0;
    
-   trade.SetExpertMagicNumber(123456);
+   trade.SetExpertMagicNumber(EA_MAGIC);
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
-   
+
+   // Health check: verify API availability and model freshness
+   if(UseMLPredictions)
+      CheckAPIHealth();
+
+   // Open trade log CSV
+   tradeLogHandle = FileOpen("trade_log.csv", FILE_WRITE|FILE_READ|FILE_CSV|FILE_SHARE_READ|FILE_ANSI, ',');
+   if(tradeLogHandle != INVALID_HANDLE)
+   {
+      // If file is empty (new), write header
+      if(FileSize(tradeLogHandle) == 0)
+      {
+         FileWrite(tradeLogHandle,
+            "timestamp","ticket","direction","entry_price","sl","tp",
+            "lot_size","ml_prediction","ml_confidence","tech_signal","features_hash");
+      }
+      FileSeek(tradeLogHandle, 0, SEEK_END);
+      Print("Trade log opened: trade_log.csv");
+   }
+   else
+   {
+      Print("WARNING: Could not open trade log file");
+   }
+
    Print("ML Integration: ", UseMLPredictions ? "ENABLED" : "DISABLED");
    Print("API URL: ", API_URL);
    Print("ML Confidence Threshold: ", ML_Confidence_Threshold);
    Print("Risk per trade: ", RiskPercent, "%");
    Print("Starting balance: $", dailyStartBalance);
-   
+
    return(INIT_SUCCEEDED);
 }
 
@@ -148,7 +182,10 @@ void OnDeinit(const int reason)
    IndicatorRelease(handleEMA200_H4);
    IndicatorRelease(handleRSI_H4);
    IndicatorRelease(handleATR_H4);
-   
+
+   if(tradeLogHandle != INVALID_HANDLE)
+      FileClose(tradeLogHandle);
+
    Print("EA Stopped. Total trades today: ", totalTradesToday);
    Print("Daily P&L: $", dailyProfitLoss);
 }
@@ -367,8 +404,10 @@ int GetMLPrediction(double &confidence)
       // Excluded: prev_return_h1, prev_return_h4
    );
    
+   lastFeaturesHash = ComputeFeaturesHash(features);
+
    string json_request = "{\"features\":" + features + "}";
-   
+
    // Make HTTP request with retry logic (max 3 attempts, 1s backoff)
    uchar post_data[];
    uchar result_data[];
@@ -446,6 +485,10 @@ int GetMLPrediction(double &confidence)
 
    string prediction = ExtractStringValue(response, "prediction");
 
+   // Store for trade logging
+   lastMLPrediction = prediction;
+   lastMLConfidence = confidence;
+
    // Structural validation: all required keys must be present
    if(StringFind(response, "\"sell\"") < 0 || StringFind(response, "\"range\"") < 0 ||
       StringFind(response, "\"buy\"") < 0 || StringFind(response, "\"confidence\"") < 0 ||
@@ -519,7 +562,10 @@ int GetTradeSignal()
    
    // If not using ML at all, get technical signal
    if(!UseMLPredictions)
-      return GetTechnicalSignal();
+   {
+      lastTechSignal = GetTechnicalSignal();
+      return lastTechSignal;
+   }
    
    // If using ML only (no technical combination)
    if(!CombineWithTechnical)
@@ -543,6 +589,7 @@ int GetTradeSignal()
    if(CombineWithTechnical)
    {
       int tech_signal = GetTechnicalSignal();
+      lastTechSignal = tech_signal;
 
       if(ml_signal == tech_signal && ml_signal != 0 && ml_confidence >= ML_Confidence_Threshold)
       {
@@ -749,6 +796,7 @@ void OpenTrade(ENUM_ORDER_TYPE orderType)
       {
          Print("BUY order opened: Lot=", lotSize, " Price=", price, " SL=", sl, " TP=", tp);
          totalTradesToday++;
+         LogTrade(trade.ResultOrder(), "BUY", price, sl, tp, lotSize);
       }
       else
       {
@@ -761,6 +809,7 @@ void OpenTrade(ENUM_ORDER_TYPE orderType)
       {
          Print("SELL order opened: Lot=", lotSize, " Price=", price, " SL=", sl, " TP=", tp);
          totalTradesToday++;
+         LogTrade(trade.ResultOrder(), "SELL", price, sl, tp, lotSize);
       }
       else
       {
@@ -825,14 +874,14 @@ void ManagePositions()
    {
       if(posInfo.SelectByIndex(i))
       {
-         if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
+         if(posInfo.Symbol() != _Symbol || posInfo.Magic() != EA_MAGIC)
             continue;
-         
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         
+
          double openPrice = posInfo.PriceOpen();
          double sl = posInfo.StopLoss();
          double profitPips = 0;
@@ -890,14 +939,14 @@ void ManageTrailingStops()
    {
       if(posInfo.SelectByIndex(i))
       {
-         if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 123456)
+         if(posInfo.Symbol() != _Symbol || posInfo.Magic() != EA_MAGIC)
             continue;
-         
+
          ulong ticket = posInfo.Ticket();
          double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
                                SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         
+
          double sl = posInfo.StopLoss();
          double trailDistance = TrailingStopPips * point * 10; // Convert pips to price
          double trailStep = TrailingStepPips * point * 10;
@@ -999,7 +1048,7 @@ int CountOpenPositions()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Symbol() == _Symbol && posInfo.Magic() == 123456)
+         if(posInfo.Symbol() == _Symbol && posInfo.Magic() == EA_MAGIC)
             count++;
    }
    return count;
@@ -1011,12 +1060,12 @@ int CountOpenPositions()
 void CloseAllPositions(string reason)
 {
    Print("Closing all positions: ", reason);
-   
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
       {
-         if(posInfo.Symbol() == _Symbol && posInfo.Magic() == 123456)
+         if(posInfo.Symbol() == _Symbol && posInfo.Magic() == EA_MAGIC)
          {
             ulong ticket = posInfo.Ticket();
             if(trade.PositionClose(ticket))
@@ -1024,5 +1073,123 @@ void CloseAllPositions(string reason)
          }
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Check API health at startup                                      |
+//+------------------------------------------------------------------+
+void CheckAPIHealth()
+{
+   uchar post_data[];
+   uchar result_data[];
+   string result_headers;
+
+   ResetLastError();
+   int res = WebRequest(
+      "GET",
+      API_HEALTH_URL,
+      "",
+      5000,
+      post_data,
+      result_data,
+      result_headers
+   );
+
+   if(res == -1)
+   {
+      int err = GetLastError();
+      Print("WARNING: Health check failed (error ", err, "). Proceeding without ML.");
+      UseMLPredictions = false;
+      return;
+   }
+
+   string response = CharArrayToString(result_data);
+   Print("Health check response: ", response);
+
+   // Parse status
+   string status = ExtractStringValue(response, "status");
+   if(status != "healthy")
+   {
+      Print("WARNING: API status is '", status, "', disabling ML predictions");
+      UseMLPredictions = false;
+   }
+
+   // Parse feature_count
+   double fc = ExtractValue(response, "feature_count");
+   int feature_count = (int)fc;
+   if(feature_count != 23)
+   {
+      Print("WARNING: Feature count mismatch — API reports ", feature_count, " but EA expects 23. Disabling ML.");
+      UseMLPredictions = false;
+   }
+
+   // Parse model_age_hours for staleness check
+   double model_age = ExtractValue(response, "model_age_hours");
+   if(model_age > ModelStalenessHours * 2)
+   {
+      Print("CRITICAL: Model >2x stale (", DoubleToString(model_age, 1), "h old), disabling ML");
+      UseMLPredictions = false;
+   }
+   else if(model_age > ModelStalenessHours)
+   {
+      Print("WARNING: Model is stale (", DoubleToString(model_age, 1), "h old)");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Compute a simple hash of the features JSON string                |
+//+------------------------------------------------------------------+
+string ComputeFeaturesHash(const string features_json)
+{
+   ulong hash = 0;
+   ulong prime = 1099511628211;  // FNV prime
+   hash = 14695981039346656037; // FNV offset basis
+
+   for(int i = 0; i < StringLen(features_json); i++)
+   {
+      ushort ch = StringGetCharacter(features_json, i);
+      hash = hash ^ ch;
+      hash = hash * prime;
+   }
+
+   // Format as 16-char hex string
+   string hex = "";
+   ulong val = hash;
+   for(int i = 0; i < 16; i++)
+   {
+      int digit = (int)(val % 16);
+      if(digit < 10)
+         hex = (string)digit + hex;
+      else
+         hex = CharToString((char)('a' + digit - 10)) + hex;
+      val = val / 16;
+   }
+   return hex;
+}
+
+//+------------------------------------------------------------------+
+//| Log a trade to the CSV file                                      |
+//+------------------------------------------------------------------+
+void LogTrade(ulong ticket, string direction, double entry_price, double sl, double tp, double lot_size)
+{
+   if(tradeLogHandle == INVALID_HANDLE)
+      return;
+
+   string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+
+   FileWrite(tradeLogHandle,
+      ts,
+      IntegerToString(ticket),
+      direction,
+      DoubleToString(entry_price, _Digits),
+      DoubleToString(sl, _Digits),
+      DoubleToString(tp, _Digits),
+      DoubleToString(lot_size, 2),
+      lastMLPrediction,
+      DoubleToString(lastMLConfidence, 4),
+      IntegerToString(lastTechSignal),
+      lastFeaturesHash);
+
+   FileFlush(tradeLogHandle);
 }
 //+------------------------------------------------------------------+
