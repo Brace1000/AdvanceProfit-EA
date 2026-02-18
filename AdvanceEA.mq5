@@ -20,7 +20,7 @@ enum ENUM_TRADE_DIRECTION
 
 // Input Parameters
 input group "=== ML API Settings ==="
-input ENUM_TRADE_DIRECTION TradeDirection = TRADE_BUY_ONLY; // Trade Direction
+input ENUM_TRADE_DIRECTION TradeDirection = TRADE_BOTH; // Trade Direction
 input string API_URL_Buy  = "http://127.0.0.1:8000/predict/buy"; // Buy API endpoint
 input string API_URL_Sell = "http://127.0.0.1:8000/predict";     // Sell API endpoint
 input double ML_Confidence_Threshold = 0.40; // Buy confidence threshold (40%)
@@ -32,8 +32,8 @@ input double RiskPercent = 1.0;              // Risk per trade (% of balance)
 input double MaxDailyLoss = 3.0;             // Max daily loss (% of balance)
 input double MaxDailyProfit = 5.0;           // Daily profit target (%)
 input int    MaxSimultaneousTrades = 2;      // Max AT-RISK positions (protected positions don't count)
-input double TP_Pips = 20.0;                // Take Profit (pips) - fixed barrier
-input double SL_Pips = 15.0;                // Stop Loss (pips) - fixed barrier
+input double TP_Pips = 10.5;                // Take Profit (pips) - fixed barrier
+input double SL_Pips = 10.5;                // Stop Loss (pips) - fixed barrier
 
 input group "=== Technical Strategy ==="
 input int    MA_Fast = 10;                   // Fast MA Period
@@ -56,14 +56,14 @@ input bool   UseRegimeFilter = false;        // Only trade in trending regimes
 input int    RegimeLookback = 500;           // Bars for rolling median
 
 input group "=== Circuit Breaker ==="
-input bool   CB_Enabled = true;              // Enable circuit breaker
+input bool   CB_Enabled = false;             // Enable circuit breaker
 input int    CB_MaxConsecLosses = 5;         // Max consecutive losses before pause
 input double CB_MaxDrawdownPips = 100.0;     // Max drawdown (pips) before pause
 input int    CB_CooldownBars = 48;           // Bars to pause after trigger
 input bool   CB_ResetOnWin = true;           // Reset loss counter on win
 
 input group "=== Twin Trade System ==="
-input bool   UseTwinTrades = true;           // Enable twin trade system
+input bool   UseTwinTrades = false;          // Enable twin trade system
 input double TwinA_TP_Pips = 10.0;           // Trade A (Banker): Take Profit pips
 input double TwinB_TP_Pips = 20.0;           // Trade B (Runner): Take Profit pips
 input double TwinB_BE_Trigger = 10.0;        // Trade B: Breakeven trigger pips
