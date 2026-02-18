@@ -25,13 +25,13 @@ input string API_URL_Buy  = "http://127.0.0.1:8000/predict/buy"; // Buy API endp
 input string API_URL_Sell = "http://127.0.0.1:8000/predict";     // Sell API endpoint
 input double ML_Confidence_Threshold = 0.40; // Buy confidence threshold (40%)
 input double ML_Sell_Threshold = 0.56;       // Sell confidence threshold (56%, BOTH mode)
-input double MinConfidenceSpread = 0.015;    // Signal must beat others by 1.5%
+input double MinConfidenceSpread = -1.0;     // Signal must beat others by X% (-1=off)
 
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of balance)
 input double MaxDailyLoss = 3.0;             // Max daily loss (% of balance)
 input double MaxDailyProfit = 5.0;           // Daily profit target (%)
-input int    MaxSimultaneousTrades = 2;      // Max AT-RISK positions (protected positions don't count)
+input int    MaxSimultaneousTrades = 1;      // Max AT-RISK positions (protected positions don't count)
 input double TP_Pips = 10.5;                // Take Profit (pips) - fixed barrier
 input double SL_Pips = 10.5;                // Stop Loss (pips) - fixed barrier
 
